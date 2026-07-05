@@ -195,18 +195,102 @@ def _resolve_media_list(text, limit):
     return urls
 
 
-def _run(endpoint, arguments):
-    def on_queue_update(update):
-        if hasattr(update, "logs") and update.logs:
-            for log in update.logs:
-                print(f"[fal {endpoint}] {log.get('message', '')}")
+def _run_request(endpoint, arguments, est_seconds=120):
+    """Отправляет запрос на fal и ждёт результат, показывая прогресс в ComfyUI.
 
-    result = fal_client.subscribe(
-        endpoint,
-        arguments=arguments,
-        with_logs=True,
-        on_queue_update=on_queue_update,
+    Прогресс-бар ноды: реальный процент из логов fal (если модель его пишет),
+    иначе — оценка по прошедшему времени относительно est_seconds.
+    Нажатие Cancel в ComfyUI отменяет задачу и на стороне fal."""
+    import re
+    import time
+
+    try:
+        from comfy.utils import ProgressBar
+        pbar = ProgressBar(100)
+    except Exception:
+        pbar = None
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        mm = None
+
+    def set_progress(value):
+        if pbar is not None:
+            pbar.update_absolute(int(min(99, max(0, value))), 100)
+
+    handler = fal_client.submit(endpoint, arguments=arguments)
+    start = time.time()
+    seen_logs = set()
+    percent_re = re.compile(r"(\d{1,3})\s*%")
+    log_percent = 0
+    last_queue_pos = None
+
+    while True:
+        # реагируем на Cancel в ComfyUI
+        if mm is not None:
+            try:
+                mm.throw_exception_if_processing_interrupted()
+            except Exception:
+                try:
+                    handler.cancel()
+                    print(f"[fal {endpoint}] задача отменена")
+                except Exception:
+                    pass
+                raise
+
+        status = handler.status(with_logs=True)
+        status_name = type(status).__name__
+
+        for log in (getattr(status, "logs", None) or []):
+            msg = (log or {}).get("message", "")
+            if msg and msg not in seen_logs:
+                seen_logs.add(msg)
+                print(f"[fal {endpoint}] {msg}")
+                m = percent_re.search(msg)
+                if m:
+                    log_percent = max(log_percent, min(100, int(m.group(1))))
+
+        if status_name == "Completed":
+            break
+        if status_name == "Queued":
+            pos = getattr(status, "position", None)
+            if pos != last_queue_pos:
+                last_queue_pos = pos
+                print(f"[fal {endpoint}] в очереди, позиция: {pos}")
+            set_progress(2)
+        else:  # InProgress
+            elapsed = time.time() - start
+            estimated = 5 + (elapsed / max(est_seconds, 1)) * 90
+            set_progress(max(estimated, log_percent))
+        time.sleep(2)
+
+    result = handler.get()
+    if pbar is not None:
+        pbar.update_absolute(100, 100)
+    return result
+
+
+def _est_video_seconds(duration, fast=False, ref=False):
+    """Грубая оценка времени генерации для прогресс-бара, в секундах."""
+    try:
+        dur = int(duration)
+    except (TypeError, ValueError):
+        dur = 6  # auto
+    est = 45 + dur * 18
+    if ref:
+        est += 60
+    if fast:
+        est *= 0.5
+    return est
+
+
+def _run(endpoint, arguments):
+    est = _est_video_seconds(
+        arguments.get("duration"),
+        fast="/fast/" in endpoint,
+        ref="reference" in endpoint,
     )
+    result = _run_request(endpoint, arguments, est)
     video = (result or {}).get("video") or {}
     url = video.get("url")
     if not url:
@@ -490,7 +574,7 @@ def _download_images_as_tensor(urls):
 
 
 def _run_gpt_image(endpoint, args):
-    result = fal_client.subscribe(endpoint, arguments=args, with_logs=False)
+    result = _run_request(endpoint, args, est_seconds=45 * args.get("num_images", 1))
     urls = [img["url"] for img in (result or {}).get("images", []) if img.get("url")]
     if not urls:
         raise RuntimeError(f"fal не вернул изображения: {result}")
