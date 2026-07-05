@@ -1,0 +1,3 @@
+[API]
+; Скопируйте этот файл в config.ini и вставьте свой ключ с https://fal.ai/dashboard/keys
+FAL_KEY = ваш-ключ-сюда

@@ -1,0 +1,8 @@
+# API-ключ — никогда не коммитим!
+config.ini
+
+__pycache__/
+*.pyc
+*.tmp
+.DS_Store
+Thumbs.db

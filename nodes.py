@@ -1,0 +1,691 @@
+"""
+ComfyUI-fal-Seedance
+Кастомные ноды для генерации видео Seedance (ByteDance) через fal.ai.
+
+Поддерживаются:
+  - Seedance 2.0: Text-to-Video, Image-to-Video (+end frame), Reference-to-Video
+    (референсы: до 9 картинок, до 3 видео, до 3 аудио), fast-варианты
+  - Seedance 1.5 Pro: Text-to-Video, Image-to-Video
+
+API-ключ: переменная окружения FAL_KEY или файл config.ini рядом с этим файлом:
+    [API]
+    FAL_KEY = ваш-ключ
+"""
+
+import os
+import io
+import configparser
+import tempfile
+
+import numpy as np
+import requests
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import fal_client
+except ImportError:
+    fal_client = None
+
+# Нативный тип VIDEO появился в ComfyUI в 2025 году; на старых сборках
+# нода вернёт только URL и локальный путь.
+try:
+    from comfy_api.input_impl import VideoFromFile
+except ImportError:
+    try:
+        from comfy_api.input_impl.video_types import VideoFromFile
+    except ImportError:
+        VideoFromFile = None
+
+try:
+    import folder_paths
+except ImportError:
+    folder_paths = None
+
+
+# ---------------------------------------------------------------------------
+# ключ и утилиты
+# ---------------------------------------------------------------------------
+
+def _ensure_api_key():
+    if os.environ.get("FAL_KEY"):
+        return
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+    if os.path.isfile(cfg_path):
+        cfg = configparser.ConfigParser()
+        # На Windows configparser по умолчанию читает в cp1252 и падает
+        # на кириллице — пробуем несколько кодировок.
+        for enc in ("utf-8-sig", "utf-8", "cp1251", None):
+            try:
+                cfg.read(cfg_path, encoding=enc)
+                break
+            except (UnicodeDecodeError, configparser.Error):
+                cfg = configparser.ConfigParser()
+                continue
+        key = cfg.get("API", "FAL_KEY", fallback="").strip()
+        if key and "ваш" not in key and "<" not in key:
+            os.environ["FAL_KEY"] = key
+            return
+    raise RuntimeError(
+        "FAL_KEY не найден. Укажите ключ в config.ini (секция [API]) "
+        "или в переменной окружения FAL_KEY. Ключ создаётся на "
+        "https://fal.ai/dashboard/keys"
+    )
+
+
+def _require_deps():
+    if fal_client is None:
+        raise RuntimeError(
+            "Модуль fal_client не установлен. Выполните: pip install fal-client"
+        )
+    _ensure_api_key()
+
+
+def _tensor_batch_to_pil(image_tensor):
+    """IMAGE-тензор ComfyUI (B,H,W,C float 0..1) -> список PIL.Image."""
+    if Image is None:
+        raise RuntimeError("Pillow не установлен: pip install pillow")
+    images = []
+    arr = image_tensor.cpu().numpy() if hasattr(image_tensor, "cpu") else np.asarray(image_tensor)
+    if arr.ndim == 3:
+        arr = arr[None, ...]
+    for frame in arr:
+        frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+        images.append(Image.fromarray(frame))
+    return images
+
+
+def _upload_pil(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(buf.read())
+        tmp = f.name
+    try:
+        return fal_client.upload_file(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _upload_image_input(image_tensor, limit=1):
+    """Загружает первые `limit` кадров IMAGE-входа в fal storage, возвращает URL'ы."""
+    urls = []
+    for img in _tensor_batch_to_pil(image_tensor)[:limit]:
+        urls.append(_upload_pil(img))
+    return urls
+
+
+def _upload_video_input(video):
+    """VIDEO-вход ComfyUI (нативная нода Load Video) -> URL в fal storage."""
+    if isinstance(video, str):
+        if video.lower().startswith(("http://", "https://")):
+            return video
+        if os.path.isfile(video):
+            return fal_client.upload_file(video)
+        raise RuntimeError(f"Видео не найдено: {video}")
+    # comfy_api VideoInput: пробуем взять исходный файл напрямую
+    src = None
+    if hasattr(video, "get_stream_source"):
+        try:
+            src = video.get_stream_source()
+        except Exception:
+            src = None
+    if isinstance(src, str) and os.path.isfile(src):
+        return fal_client.upload_file(src)
+    # иначе сохраняем во временный mp4
+    fd, tmp = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        video.save_to(tmp)
+        return fal_client.upload_file(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _upload_audio_input(audio):
+    """AUDIO-вход ComfyUI ({'waveform': (B,C,T), 'sample_rate': int}) -> URL wav в fal storage."""
+    import wave
+    wf = audio["waveform"]
+    sr = int(audio["sample_rate"])
+    arr = wf[0].cpu().numpy() if hasattr(wf, "cpu") else np.asarray(wf)[0]  # (C, T)
+    arr = np.clip(arr, -1.0, 1.0)
+    pcm = (arr * 32767.0).astype("<i2")
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(tmp, "wb") as w:
+            w.setnchannels(pcm.shape[0])
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(pcm.T.tobytes())
+        return fal_client.upload_file(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _resolve_media_list(text, limit):
+    """Многострочное поле: каждая строка — URL или локальный путь.
+    Локальные файлы загружаются в fal storage."""
+    urls = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith(("http://", "https://", "data:")):
+            urls.append(line)
+        elif os.path.isfile(line):
+            urls.append(fal_client.upload_file(line))
+        else:
+            raise RuntimeError(f"Файл не найден и это не URL: {line}")
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def _run(endpoint, arguments):
+    def on_queue_update(update):
+        if hasattr(update, "logs") and update.logs:
+            for log in update.logs:
+                print(f"[fal {endpoint}] {log.get('message', '')}")
+
+    result = fal_client.subscribe(
+        endpoint,
+        arguments=arguments,
+        with_logs=True,
+        on_queue_update=on_queue_update,
+    )
+    video = (result or {}).get("video") or {}
+    url = video.get("url")
+    if not url:
+        raise RuntimeError(f"fal не вернул видео: {result}")
+    return url
+
+
+def _download(url, prefix):
+    out_dir = folder_paths.get_output_directory() if folder_paths else tempfile.gettempdir()
+    os.makedirs(out_dir, exist_ok=True)
+    idx = 0
+    while True:
+        path = os.path.join(out_dir, f"{prefix}_{idx:05d}.mp4")
+        if not os.path.exists(path):
+            break
+        idx += 1
+    resp = requests.get(url, stream=True, timeout=600)
+    resp.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 20):
+            f.write(chunk)
+    return path
+
+
+def _finish(url, prefix):
+    path = _download(url, prefix)
+    video_obj = VideoFromFile(path) if VideoFromFile else None
+    return (video_obj, url, path)
+
+
+DURATIONS_20 = ["auto"] + [str(i) for i in range(4, 16)]      # Seedance 2.0: auto, 4..15
+DURATIONS_15 = [str(i) for i in range(4, 13)]                 # Seedance 1.5: 4..12
+ASPECTS_20 = ["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+ASPECTS_15 = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+
+RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+RETURN_NAMES = ("video", "video_url", "local_path")
+CATEGORY = "fal/Seedance"
+
+
+def _seed_arg(args, seed):
+    if seed is not None and seed >= 0:
+        args["seed"] = seed
+
+
+DURATION_OVERRIDE_INPUT = ("FLOAT", {
+    "default": 0.0, "min": 0.0, "max": 60.0, "step": 0.1,
+    "forceInput": True,
+    "tooltip": "Если подключено и > 0 — перекрывает виджет duration. "
+               "Секунды, округляются и зажимаются в допустимый диапазон.",
+})
+
+
+def _duration_value(duration, duration_override, lo, hi):
+    """Выбор длительности: подключённый duration_override (секунды, FLOAT)
+    имеет приоритет над комбо-виджетом."""
+    if duration_override is not None and duration_override > 0:
+        return str(max(lo, min(hi, int(round(duration_override)))))
+    return duration
+
+
+# ---------------------------------------------------------------------------
+# Seedance 2.0
+# ---------------------------------------------------------------------------
+
+class Seedance2TextToVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "480p"], {"default": "720p"}),
+                "duration": (DURATIONS_20, {"default": "auto"}),
+                "aspect_ratio": (ASPECTS_20, {"default": "16:9"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "fast_mode": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, prompt, resolution, duration, aspect_ratio,
+                 generate_audio, fast_mode, duration_override=0.0, seed=-1):
+        _require_deps()
+        endpoint = ("bytedance/seedance-2.0/fast/text-to-video"
+                    if fast_mode else "bytedance/seedance-2.0/text-to-video")
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 15),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": generate_audio,
+        }
+        _seed_arg(args, seed)
+        return _finish(_run(endpoint, args), "seedance2_t2v")
+
+
+class Seedance2ImageToVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "480p", "1080p"], {"default": "720p"}),
+                "duration": (DURATIONS_20, {"default": "auto"}),
+                "aspect_ratio": (ASPECTS_20, {"default": "auto"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "fast_mode": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "end_image": ("IMAGE",),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, image, prompt, resolution, duration, aspect_ratio,
+                 generate_audio, fast_mode, end_image=None,
+                 duration_override=0.0, seed=-1):
+        _require_deps()
+        endpoint = ("bytedance/seedance-2.0/fast/image-to-video"
+                    if fast_mode else "bytedance/seedance-2.0/image-to-video")
+        args = {
+            "prompt": prompt,
+            "image_url": _upload_image_input(image, 1)[0],
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 15),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": generate_audio,
+        }
+        if end_image is not None:
+            args["end_image_url"] = _upload_image_input(end_image, 1)[0]
+        _seed_arg(args, seed)
+        return _finish(_run(endpoint, args), "seedance2_i2v")
+
+
+class Seedance2ReferenceToVideo:
+    """Мультимодальный режим: до 9 референс-картинок (@Image1, @Image2 ... в промпте),
+    до 3 референс-видео и до 3 аудио.
+
+    Картинки — входы image_1..image_4 (IMAGE, батч учитывается целиком) и/или
+    список URL в image_urls. Видео — входы video_1..video_3 (VIDEO, нативная нода
+    Load Video) и/или пути/URL в video_refs. Аудио — входы audio_1..audio_3 (AUDIO)
+    и/или пути/URL в audio_refs. Нумерация @ImageN идёт по порядку: image_1..image_4,
+    затем строки image_urls."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "480p", "1080p"], {"default": "720p"}),
+                "duration": (DURATIONS_20, {"default": "auto"}),
+                "aspect_ratio": (ASPECTS_20, {"default": "auto"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "video_1": ("VIDEO",),
+                "video_2": ("VIDEO",),
+                "video_3": ("VIDEO",),
+                "audio_1": ("AUDIO",),
+                "audio_2": ("AUDIO",),
+                "audio_3": ("AUDIO",),
+                "image_urls": ("STRING", {"multiline": True, "default": ""}),
+                "video_refs": ("STRING", {"multiline": True, "default": ""}),
+                "audio_refs": ("STRING", {"multiline": True, "default": ""}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, prompt, resolution, duration, aspect_ratio, generate_audio,
+                 image_1=None, image_2=None, image_3=None, image_4=None,
+                 video_1=None, video_2=None, video_3=None,
+                 audio_1=None, audio_2=None, audio_3=None,
+                 image_urls="", video_refs="", audio_refs="",
+                 duration_override=0.0, seed=-1):
+        _require_deps()
+
+        img_urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None and len(img_urls) < 9:
+                img_urls += _upload_image_input(img, 9 - len(img_urls))
+        img_urls += _resolve_media_list(image_urls, 9 - len(img_urls))
+
+        vid_urls = []
+        for vid in (video_1, video_2, video_3):
+            if vid is not None and len(vid_urls) < 3:
+                vid_urls.append(_upload_video_input(vid))
+        vid_urls += _resolve_media_list(video_refs, 3 - len(vid_urls))
+
+        aud_urls = []
+        for aud in (audio_1, audio_2, audio_3):
+            if aud is not None and len(aud_urls) < 3:
+                aud_urls.append(_upload_audio_input(aud))
+        aud_urls += _resolve_media_list(audio_refs, 3 - len(aud_urls))
+
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 15),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": generate_audio,
+        }
+        if img_urls:
+            args["image_urls"] = img_urls
+        if vid_urls:
+            args["video_urls"] = vid_urls
+        if aud_urls:
+            args["audio_urls"] = aud_urls
+        _seed_arg(args, seed)
+        return _finish(_run("bytedance/seedance-2.0/reference-to-video", args),
+                       "seedance2_ref")
+
+
+# ---------------------------------------------------------------------------
+# GPT Image 2 (OpenAI через fal)
+# ---------------------------------------------------------------------------
+
+GPT_IMAGE_SIZES = ["auto", "square_hd", "square", "portrait_4_3", "portrait_16_9",
+                   "landscape_4_3", "landscape_16_9"]
+GPT_QUALITY = ["high", "auto", "low", "medium"]
+
+
+def _gpt_image_size(image_size, custom_width, custom_height):
+    if custom_width > 0 and custom_height > 0:
+        return {"width": custom_width, "height": custom_height}
+    return image_size
+
+
+def _mask_to_url(mask):
+    """MASK ComfyUI (B,H,W, 1=редактируемая область) -> RGBA PNG,
+    где редактируемая область прозрачна (конвенция OpenAI)."""
+    arr = mask.cpu().numpy() if hasattr(mask, "cpu") else np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[0]
+    alpha = ((1.0 - np.clip(arr, 0, 1)) * 255).astype(np.uint8)
+    h, w = alpha.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 3] = alpha
+    return _upload_pil(Image.fromarray(rgba, mode="RGBA"))
+
+
+def _download_images_as_tensor(urls):
+    """Скачивает картинки и собирает IMAGE-батч ComfyUI."""
+    import torch
+    pils = []
+    for u in urls:
+        resp = requests.get(u, timeout=300)
+        resp.raise_for_status()
+        pils.append(Image.open(io.BytesIO(resp.content)).convert("RGB"))
+    base = pils[0].size
+    arrs = []
+    for p in pils:
+        if p.size != base:
+            p = p.resize(base, Image.LANCZOS)
+        arrs.append(np.asarray(p).astype(np.float32) / 255.0)
+    return torch.from_numpy(np.stack(arrs))
+
+
+def _run_gpt_image(endpoint, args):
+    result = fal_client.subscribe(endpoint, arguments=args, with_logs=False)
+    urls = [img["url"] for img in (result or {}).get("images", []) if img.get("url")]
+    if not urls:
+        raise RuntimeError(f"fal не вернул изображения: {result}")
+    return _download_images_as_tensor(urls), "\n".join(urls)
+
+
+class GPTImage2TextToImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (GPT_IMAGE_SIZES, {"default": "landscape_4_3"}),
+                "quality": (GPT_QUALITY, {"default": "high"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/GPT Image"
+
+    def generate(self, prompt, image_size, quality, num_images,
+                 custom_width=0, custom_height=0):
+        _require_deps()
+        args = {
+            "prompt": prompt,
+            "image_size": _gpt_image_size(image_size, custom_width, custom_height),
+            "quality": quality,
+            "num_images": num_images,
+            "output_format": "png",
+        }
+        return _run_gpt_image("openai/gpt-image-2", args)
+
+
+class GPTImage2Edit:
+    """Редактирование/композиция: до 4 картинок сокетами + список URL,
+    опциональная маска (белое = область, которую нужно изменить)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_1": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (GPT_IMAGE_SIZES, {"default": "auto"}),
+                "quality": (GPT_QUALITY, {"default": "high"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "mask": ("MASK",),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/GPT Image"
+
+    def generate(self, image_1, prompt, image_size, quality, num_images,
+                 image_2=None, image_3=None, image_4=None, mask=None,
+                 extra_image_urls="", custom_width=0, custom_height=0):
+        _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                urls += _upload_image_input(img, 16 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 16 - len(urls))
+
+        args = {
+            "prompt": prompt,
+            "image_urls": urls,
+            "image_size": _gpt_image_size(image_size, custom_width, custom_height),
+            "quality": quality,
+            "num_images": num_images,
+            "output_format": "png",
+        }
+        if mask is not None:
+            args["mask_url"] = _mask_to_url(mask)
+        return _run_gpt_image("openai/gpt-image-2/edit", args)
+
+
+# ---------------------------------------------------------------------------
+# Seedance 1.5 Pro
+# ---------------------------------------------------------------------------
+
+class Seedance15ProTextToVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "480p"], {"default": "720p"}),
+                "duration": (DURATIONS_15, {"default": "5"}),
+                "aspect_ratio": (ASPECTS_15, {"default": "16:9"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "camera_fixed": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, prompt, resolution, duration, aspect_ratio,
+                 generate_audio, camera_fixed, duration_override=0.0, seed=-1):
+        _require_deps()
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 12),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": generate_audio,
+            "camera_fixed": camera_fixed,
+        }
+        _seed_arg(args, seed)
+        return _finish(_run("fal-ai/bytedance/seedance/v1.5/pro/text-to-video", args),
+                       "seedance15_t2v")
+
+
+class Seedance15ProImageToVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "480p"], {"default": "720p"}),
+                "duration": (DURATIONS_15, {"default": "5"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "camera_fixed": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "end_image": ("IMAGE",),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, image, prompt, resolution, duration,
+                 generate_audio, camera_fixed, end_image=None,
+                 duration_override=0.0, seed=-1):
+        _require_deps()
+        args = {
+            "prompt": prompt,
+            "image_url": _upload_image_input(image, 1)[0],
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 12),
+            "generate_audio": generate_audio,
+            "camera_fixed": camera_fixed,
+        }
+        if end_image is not None:
+            args["end_image_url"] = _upload_image_input(end_image, 1)[0]
+        _seed_arg(args, seed)
+        return _finish(_run("fal-ai/bytedance/seedance/v1.5/pro/image-to-video", args),
+                       "seedance15_i2v")
+
+
+NODE_CLASS_MAPPINGS = {
+    "Seedance2TextToVideo_fal": Seedance2TextToVideo,
+    "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
+    "Seedance2ReferenceToVideo_fal": Seedance2ReferenceToVideo,
+    "Seedance15ProTextToVideo_fal": Seedance15ProTextToVideo,
+    "Seedance15ProImageToVideo_fal": Seedance15ProImageToVideo,
+    "GPTImage2TextToImage_fal": GPTImage2TextToImage,
+    "GPTImage2Edit_fal": GPTImage2Edit,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Seedance2TextToVideo_fal": "Seedance 2.0 Text-to-Video (fal)",
+    "Seedance2ImageToVideo_fal": "Seedance 2.0 Image-to-Video (fal)",
+    "Seedance2ReferenceToVideo_fal": "Seedance 2.0 Reference-to-Video (fal)",
+    "Seedance15ProTextToVideo_fal": "Seedance 1.5 Pro Text-to-Video (fal)",
+    "Seedance15ProImageToVideo_fal": "Seedance 1.5 Pro Image-to-Video (fal)",
+    "GPTImage2TextToImage_fal": "GPT Image 2 Text-to-Image (fal)",
+    "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
+}
