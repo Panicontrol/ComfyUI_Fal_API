@@ -284,7 +284,84 @@ def _est_video_seconds(duration, fast=False, ref=False):
     return est
 
 
+# ---------------------------------------------------------------------------
+# предварительная оценка стоимости
+# ---------------------------------------------------------------------------
+
+_RES_H = {"480p": 480, "720p": 720, "1080p": 1080}
+
+# Seedance: токены = w*h*24*сек/1024
+_SEEDANCE2_RATE = 0.014 / 1000       # $ за токен (standard)
+_SEEDANCE2_FAST_RATE = 0.0112 / 1000  # $ за токен (fast, ~$0.2419/с на 720p)
+_SEEDANCE15_AUDIO_RATE = 2.4 / 1e6    # $ за токен со звуком
+_SEEDANCE15_RATE = 1.2 / 1e6          # $ за токен без звука
+
+# GPT Image 2: $ за изображение (пиксели -> {low, medium, high})
+_GPT_PRICES = [
+    (1024 * 768, {"low": 0.005, "medium": 0.037, "high": 0.145}),
+    (1024 * 1024, {"low": 0.006, "medium": 0.053, "high": 0.211}),
+    (1024 * 1536, {"low": 0.005, "medium": 0.042, "high": 0.165}),
+    (1920 * 1080, {"low": 0.005, "medium": 0.040, "high": 0.158}),
+    (2560 * 1440, {"low": 0.007, "medium": 0.056, "high": 0.222}),
+    (3840 * 2160, {"low": 0.012, "medium": 0.101, "high": 0.401}),
+]
+_GPT_PRESET_PX = {
+    "auto": 1024 * 1024,
+    "square": 1024 * 1024,
+    "square_hd": 1536 * 1536,
+    "portrait_4_3": 768 * 1024,
+    "portrait_16_9": 1080 * 1920,
+    "landscape_4_3": 1024 * 768,
+    "landscape_16_9": 1920 * 1080,
+}
+
+
+def _px_dims(resolution, aspect_ratio):
+    h = _RES_H.get(resolution, 720)
+    ar = aspect_ratio if aspect_ratio and aspect_ratio != "auto" else "16:9"
+    try:
+        aw, ah = ar.split(":")
+        w = int(h * int(aw) / int(ah))
+    except (ValueError, ZeroDivisionError):
+        w = int(h * 16 / 9)
+    return w, h
+
+
+def _video_cost_text(endpoint, args):
+    w, h = _px_dims(args.get("resolution", "720p"), args.get("aspect_ratio"))
+    tokens_per_sec = w * h * 24 / 1024
+    if "seedance-2.0" in endpoint:
+        per_sec = tokens_per_sec * (_SEEDANCE2_FAST_RATE if "/fast/" in endpoint
+                                    else _SEEDANCE2_RATE)
+        lo, hi = 4, 15
+    else:
+        per_sec = tokens_per_sec * (_SEEDANCE15_AUDIO_RATE
+                                    if args.get("generate_audio", True)
+                                    else _SEEDANCE15_RATE)
+        lo, hi = 4, 12
+    dur = args.get("duration")
+    if dur in (None, "auto"):
+        return f"~${per_sec * lo:.2f}–${per_sec * hi:.2f} (auto, {lo}–{hi} с)"
+    return f"~${per_sec * int(dur):.2f} ({dur} с)"
+
+
+def _gpt_cost_text(args):
+    size = args.get("image_size", "auto")
+    if isinstance(size, dict):
+        px = size.get("width", 1024) * size.get("height", 1024)
+    else:
+        px = _GPT_PRESET_PX.get(size, 1024 * 1024)
+    prices = min(_GPT_PRICES, key=lambda row: abs(row[0] - px))[1]
+    quality = args.get("quality", "high")
+    if quality == "auto":
+        quality = "high"
+    n = args.get("num_images", 1)
+    return f"~${prices[quality] * n:.3f} ({n} шт, {quality})"
+
+
 def _run(endpoint, arguments):
+    print(f"[fal {endpoint}] ориентировочная стоимость: "
+          f"{_video_cost_text(endpoint, arguments)}")
     est = _est_video_seconds(
         arguments.get("duration"),
         fast="/fast/" in endpoint,
@@ -574,6 +651,7 @@ def _download_images_as_tensor(urls):
 
 
 def _run_gpt_image(endpoint, args):
+    print(f"[fal {endpoint}] ориентировочная стоимость: {_gpt_cost_text(args)}")
     result = _run_request(endpoint, args, est_seconds=45 * args.get("num_images", 1))
     urls = [img["url"] for img in (result or {}).get("images", []) if img.get("url")]
     if not urls:
