@@ -122,6 +122,22 @@ def _upload_image_input(image_tensor, limit=1):
     return urls
 
 
+def _video_duration(video):
+    """Пробует узнать длительность VIDEO-входа в секундах (None, если не удалось)."""
+    try:
+        if hasattr(video, "get_duration"):
+            return float(video.get_duration())
+        if hasattr(video, "get_components"):
+            comp = video.get_components()
+            frames = getattr(comp, "images", None)
+            fps = float(getattr(comp, "frame_rate", 0) or 0)
+            if frames is not None and fps > 0:
+                return len(frames) / fps
+    except Exception:
+        pass
+    return None
+
+
 def _upload_video_input(video):
     """VIDEO-вход ComfyUI (нативная нода Load Video) -> URL в fal storage."""
     if isinstance(video, str):
@@ -130,6 +146,14 @@ def _upload_video_input(video):
         if os.path.isfile(video):
             return fal_client.upload_file(video)
         raise RuntimeError(f"Видео не найдено: {video}")
+    dur = _video_duration(video)
+    if dur is not None and dur < 2.0:
+        raise RuntimeError(
+            f"Референс-видео слишком короткое: {dur:.2f} с (fal требует 2–15 с "
+            f"суммарно). Похоже, в видео-вход попал одиночный кадр или картинка, "
+            f"собранная в видео. Подключи нативную ноду Load Video с настоящим "
+            f"роликом (это сэкономит и деньги — запрос не уйдёт на fal)."
+        )
     # comfy_api VideoInput: пробуем взять исходный файл напрямую
     src = None
     if hasattr(video, "get_stream_source"):
@@ -204,6 +228,11 @@ def _run_request(endpoint, arguments, est_seconds=120):
     import re
     import time
 
+    def _fal_error_text(exc):
+        s = str(exc)
+        msgs = re.findall(r"['\"]msg['\"]:\s*['\"]([^'\"]+)['\"]", s)
+        return "; ".join(msgs) if msgs else s
+
     try:
         from comfy.utils import ProgressBar
         pbar = ProgressBar(100)
@@ -218,7 +247,10 @@ def _run_request(endpoint, arguments, est_seconds=120):
         if pbar is not None:
             pbar.update_absolute(int(min(99, max(0, value))), 100)
 
-    handler = fal_client.submit(endpoint, arguments=arguments)
+    try:
+        handler = fal_client.submit(endpoint, arguments=arguments)
+    except Exception as e:
+        raise RuntimeError(f"fal отклонил запрос: {_fal_error_text(e)}") from e
     start = time.time()
     seen_logs = set()
     percent_re = re.compile(r"(\d{1,3})\s*%")
@@ -264,7 +296,10 @@ def _run_request(endpoint, arguments, est_seconds=120):
             set_progress(max(estimated, log_percent))
         time.sleep(2)
 
-    result = handler.get()
+    try:
+        result = handler.get()
+    except Exception as e:
+        raise RuntimeError(f"fal вернул ошибку: {_fal_error_text(e)}") from e
     if pbar is not None:
         pbar.update_absolute(100, 100)
     return result
@@ -575,10 +610,18 @@ class Seedance2ReferenceToVideo:
                 img_urls += _upload_image_input(img, 9 - len(img_urls))
         img_urls += _resolve_media_list(image_urls, 9 - len(img_urls))
 
-        vid_urls = []
+        vid_urls, vid_total = [], 0.0
         for vid in (video_1, video_2, video_3):
             if vid is not None and len(vid_urls) < 3:
+                d = _video_duration(vid)
+                if d:
+                    vid_total += d
                 vid_urls.append(_upload_video_input(vid))
+        if vid_total > 15.0:
+            raise RuntimeError(
+                f"Суммарная длительность референс-видео {vid_total:.1f} с — "
+                f"больше лимита fal (2–15 с суммарно). Подрежь ролики."
+            )
         vid_urls += _resolve_media_list(video_refs, 3 - len(vid_urls))
 
         aud_urls = []
