@@ -122,58 +122,94 @@ def _upload_image_input(image_tensor, limit=1):
     return urls
 
 
-def _video_duration(video):
-    """Пробует узнать длительность VIDEO-входа в секундах (None, если не удалось)."""
-    try:
-        if hasattr(video, "get_duration"):
-            return float(video.get_duration())
-        if hasattr(video, "get_components"):
-            comp = video.get_components()
-            frames = getattr(comp, "images", None)
-            fps = float(getattr(comp, "frame_rate", 0) or 0)
-            if frames is not None and fps > 0:
-                return len(frames) / fps
-    except Exception:
-        pass
-    return None
+def _reencode_video(src_path):
+    """Перекодирует видео в чистый H.264 mp4 с корректными тайм-метками.
+
+    Ролики из Unreal/NLE часто имеют битые метаданные длительности:
+    локальный плеер их играет, а парсер fal видит «1 кадр» (0.04 с)
+    и отклоняет запрос. Возвращает (путь_tmp, длительность_с)."""
+    import av
+    from fractions import Fraction
+
+    with av.open(src_path) as inp:
+        vstream = inp.streams.video[0]
+        rate = vstream.average_rate or vstream.guessed_rate or Fraction(24, 1)
+        cc = vstream.codec_context
+        width = cc.width - (cc.width % 2)
+        height = cc.height - (cc.height % 2)
+
+        fd, tmp = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        n = 0
+        with av.open(tmp, "w") as out:
+            out_v = out.add_stream("h264", rate=rate)
+            out_v.width = width
+            out_v.height = height
+            out_v.pix_fmt = "yuv420p"
+            out_v.options = {"crf": "18", "preset": "fast"}
+            for frame in inp.decode(vstream):
+                frame = frame.reformat(width=width, height=height,
+                                       format="yuv420p")
+                frame.pts = None
+                for pkt in out_v.encode(frame):
+                    out.mux(pkt)
+                n += 1
+            for pkt in out_v.encode():
+                out.mux(pkt)
+    return tmp, n / float(rate)
 
 
-def _upload_video_input(video):
-    """VIDEO-вход ComfyUI (нативная нода Load Video) -> URL в fal storage."""
+def _upload_video_input(video, label="видео"):
+    """VIDEO-вход ComfyUI -> URL в fal storage.
+
+    Видео всегда перекодируется перед загрузкой (лечит битые тайм-метки).
+    Возвращает (url, длительность_с | None)."""
+    if isinstance(video, str) and video.lower().startswith(("http://", "https://")):
+        return video, None
+
+    # получаем локальный файл-источник
+    src, tmp_src = None, None
     if isinstance(video, str):
-        if video.lower().startswith(("http://", "https://")):
-            return video
-        if os.path.isfile(video):
-            return fal_client.upload_file(video)
-        raise RuntimeError(f"Видео не найдено: {video}")
-    dur = _video_duration(video)
-    if dur is not None and dur < 2.0:
-        raise RuntimeError(
-            f"Референс-видео слишком короткое: {dur:.2f} с (fal требует 2–15 с "
-            f"суммарно). Похоже, в видео-вход попал одиночный кадр или картинка, "
-            f"собранная в видео. Подключи нативную ноду Load Video с настоящим "
-            f"роликом (это сэкономит и деньги — запрос не уйдёт на fal)."
-        )
-    # comfy_api VideoInput: пробуем взять исходный файл напрямую
-    src = None
-    if hasattr(video, "get_stream_source"):
-        try:
-            src = video.get_stream_source()
-        except Exception:
-            src = None
-    if isinstance(src, str) and os.path.isfile(src):
-        return fal_client.upload_file(src)
-    # иначе сохраняем во временный mp4
-    fd, tmp = tempfile.mkstemp(suffix=".mp4")
-    os.close(fd)
+        if not os.path.isfile(video):
+            raise RuntimeError(f"Видео не найдено: {video}")
+        src = video
+    else:
+        if hasattr(video, "get_stream_source"):
+            try:
+                s = video.get_stream_source()
+                if isinstance(s, str) and os.path.isfile(s):
+                    src = s
+            except Exception:
+                pass
+        if src is None:
+            fd, tmp_src = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            video.save_to(tmp_src)
+            src = tmp_src
+
+    tmp_enc = None
     try:
-        video.save_to(tmp)
-        return fal_client.upload_file(tmp)
-    finally:
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+            tmp_enc, dur = _reencode_video(src)
+            upload_path = tmp_enc
+        except ImportError:
+            upload_path, dur = src, None  # нет PyAV — грузим как есть
+        if dur is not None:
+            print(f"[fal] {label}: {dur:.2f} с после перекодировки")
+            if dur < 2.0:
+                raise RuntimeError(
+                    f"Референс-{label} слишком короткое: {dur:.2f} с "
+                    f"(fal требует 2–15 с суммарно). Похоже, в видео-вход "
+                    f"попал одиночный кадр — подключи полноценный ролик."
+                )
+        return fal_client.upload_file(upload_path), dur
+    finally:
+        for p in (tmp_src, tmp_enc):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 def _upload_audio_input(audio):
@@ -611,12 +647,12 @@ class Seedance2ReferenceToVideo:
         img_urls += _resolve_media_list(image_urls, 9 - len(img_urls))
 
         vid_urls, vid_total = [], 0.0
-        for vid in (video_1, video_2, video_3):
+        for i, vid in enumerate((video_1, video_2, video_3), 1):
             if vid is not None and len(vid_urls) < 3:
-                d = _video_duration(vid)
+                url, d = _upload_video_input(vid, label=f"video_{i}")
                 if d:
                     vid_total += d
-                vid_urls.append(_upload_video_input(vid))
+                vid_urls.append(url)
         if vid_total > 15.0:
             raise RuntimeError(
                 f"Суммарная длительность референс-видео {vid_total:.1f} с — "
