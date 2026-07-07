@@ -563,11 +563,14 @@ def _seed_arg(args, seed):
         args["seed"] = seed
 
 
+# Обычный FLOAT-виджет (НЕ forceInput: скрытые входы ломают порядок
+# widgets_values при перезагрузке окна — seed превращался в NaN).
+# Провод подключается прямо к точке слева от виджета.
 DURATION_OVERRIDE_INPUT = ("FLOAT", {
     "default": 0.0, "min": 0.0, "max": 60.0, "step": 0.1,
-    "forceInput": True,
-    "tooltip": "Если подключено и > 0 — перекрывает виджет duration. "
-               "Секунды, округляются и зажимаются в допустимый диапазон.",
+    "tooltip": "Если > 0 (или подключён провод) — перекрывает виджет "
+               "duration. Секунды, округляются и зажимаются в допустимый "
+               "диапазон.",
 })
 
 
@@ -596,8 +599,8 @@ class Seedance2TextToVideo:
                 "fast_mode": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "duration_override": DURATION_OVERRIDE_INPUT,
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
             },
         }
 
@@ -637,8 +640,8 @@ class Seedance2ImageToVideo:
             },
             "optional": {
                 "end_image": ("IMAGE",),
-                "duration_override": DURATION_OVERRIDE_INPUT,
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
             },
         }
 
@@ -701,8 +704,8 @@ class Seedance2ReferenceToVideo:
                 "image_urls": ("STRING", {"multiline": True, "default": ""}),
                 "video_refs": ("STRING", {"multiline": True, "default": ""}),
                 "audio_refs": ("STRING", {"multiline": True, "default": ""}),
-                "duration_override": DURATION_OVERRIDE_INPUT,
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
             },
         }
 
@@ -951,8 +954,8 @@ class Seedance15ProTextToVideo:
                 "camera_fixed": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "duration_override": DURATION_OVERRIDE_INPUT,
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
             },
         }
 
@@ -991,8 +994,8 @@ class Seedance15ProImageToVideo:
             },
             "optional": {
                 "end_image": ("IMAGE",),
-                "duration_override": DURATION_OVERRIDE_INPUT,
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
             },
         }
 
