@@ -238,9 +238,11 @@ def _upload_audio_input(audio):
 
 def _resolve_media_list(text, limit):
     """Многострочное поле: каждая строка — URL или локальный путь.
-    Локальные файлы загружаются в fal storage."""
+    Локальные файлы загружаются в fal storage. Строки, не похожие ни на путь,
+    ни на URL (например «0» от сдвига виджетов старой ноды), пропускаются
+    с предупреждением."""
     urls = []
-    for line in (text or "").splitlines():
+    for line in (str(text) if text is not None else "").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -248,8 +250,11 @@ def _resolve_media_list(text, limit):
             urls.append(line)
         elif os.path.isfile(line):
             urls.append(fal_client.upload_file(line))
-        else:
+        elif any(ch in line for ch in "/\\.") :
             raise RuntimeError(f"Файл не найден и это не URL: {line}")
+        else:
+            print(f"[fal] строка «{line}» не похожа на путь или URL — пропускаю "
+                  f"(если нода старая, пересоздай её: Fix node / удалить и добавить)")
         if len(urls) >= limit:
             break
     return urls
@@ -758,9 +763,11 @@ class GPTImage2TextToImage:
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "mask": ("MASK",),
-                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+                # порядок виджетов: custom_* раньше extra_image_urls, чтобы
+                # старые ноды на канвасе не ловили сдвиг значений
                 "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
                 "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
             },
         }
 
