@@ -122,12 +122,47 @@ def _upload_image_input(image_tensor, limit=1):
     return urls
 
 
+def _probe_container_duration(path):
+    """Длительность видео по метаданным контейнера — так его увидит fal."""
+    try:
+        import av
+        with av.open(path) as c:
+            if c.duration:
+                return c.duration / 1_000_000.0  # микросекунды
+            v = c.streams.video[0]
+            if v.duration and v.time_base:
+                return float(v.duration * v.time_base)
+    except Exception:
+        pass
+    return None
+
+
+def _ffmpeg_exe():
+    import shutil
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _mktmp_mp4():
+    fd, tmp = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    return tmp
+
+
 def _reencode_video(src_path):
     """Перекодирует видео в чистый H.264 mp4 с корректными тайм-метками.
 
-    Ролики из Unreal/NLE часто имеют битые метаданные длительности:
-    локальный плеер их играет, а парсер fal видит «1 кадр» (0.04 с)
-    и отклоняет запрос. Возвращает (путь_tmp, длительность_с)."""
+    Ролики из Unreal/NLE часто имеют битые pts: локальный плеер их играет,
+    а парсер fal видит «1 кадр» (0.04 с) и отклоняет запрос.
+    После кодирования длительность проверяется по метаданным контейнера
+    (как её увидит fal); если она всё ещё битая — запасной путь через ffmpeg.
+    Возвращает (путь_tmp, длительность_с)."""
     import av
     from fractions import Fraction
 
@@ -138,8 +173,8 @@ def _reencode_video(src_path):
         width = cc.width - (cc.width % 2)
         height = cc.height - (cc.height % 2)
 
-        fd, tmp = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd)
+        tmp = _mktmp_mp4()
+        time_base = Fraction(rate.denominator, rate.numerator)
         n = 0
         with av.open(tmp, "w") as out:
             out_v = out.add_stream("h264", rate=rate)
@@ -147,16 +182,55 @@ def _reencode_video(src_path):
             out_v.height = height
             out_v.pix_fmt = "yuv420p"
             out_v.options = {"crf": "18", "preset": "fast"}
+            try:
+                out_v.codec_context.time_base = time_base
+            except Exception:
+                pass
             for frame in inp.decode(vstream):
                 frame = frame.reformat(width=width, height=height,
                                        format="yuv420p")
-                frame.pts = None
+                # явные тайм-метки: кадр i в момент i/fps
+                frame.pts = n
+                frame.time_base = time_base
                 for pkt in out_v.encode(frame):
                     out.mux(pkt)
                 n += 1
             for pkt in out_v.encode():
                 out.mux(pkt)
-    return tmp, n / float(rate)
+
+    expected = n / float(rate)
+    got = _probe_container_duration(tmp)
+    if got is not None and abs(got - expected) < max(0.5, expected * 0.2):
+        return tmp, expected
+
+    # PyAV не справился — пробуем ffmpeg (идёт в комплекте VideoHelperSuite)
+    print(f"[fal] контейнер после PyAV: {got} с вместо {expected:.2f} с, "
+          f"пробую ffmpeg")
+    exe = _ffmpeg_exe()
+    if exe:
+        import subprocess
+        tmp2 = _mktmp_mp4()
+        cmd = [exe, "-y", "-r", str(rate), "-i", src_path, "-an",
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+               "-preset", "fast", "-movflags", "+faststart", tmp2]
+        proc = subprocess.run(cmd, capture_output=True)
+        got2 = _probe_container_duration(tmp2) if proc.returncode == 0 else None
+        if got2 is not None and abs(got2 - expected) < max(0.5, expected * 0.2):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return tmp2, expected
+        try:
+            os.unlink(tmp2)
+        except OSError:
+            pass
+    raise RuntimeError(
+        f"Не удалось получить видео с корректной длительностью: контейнер "
+        f"показывает {got} с при ожидаемых {expected:.2f} с. Прогони ролик "
+        f"через ffmpeg вручную: ffmpeg -r {rate} -i вход.mp4 -c:v libx264 "
+        f"-pix_fmt yuv420p выход.mp4"
+    )
 
 
 def _upload_video_input(video, label="видео"):
