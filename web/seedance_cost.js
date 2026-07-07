@@ -73,6 +73,18 @@ function gptCost(v) {
   return `≈ ${fmt(best[1][q] * n)}`;
 }
 
+// Nano Banana: $ за изображение по модели и разрешению
+const NB_PRICE = {
+  "nano-banana-2":   { "0.5K": 0.06, "1K": 0.08, "2K": 0.12, "4K": 0.16 },
+  "nano-banana-pro": { "0.5K": 0.15, "1K": 0.15, "2K": 0.15, "4K": 0.30 },
+};
+
+function nanoBananaCost(v) {
+  const table = NB_PRICE[v.model] || NB_PRICE["nano-banana-2"];
+  const per = table[v.resolution] ?? 0.08;
+  return `≈ ${fmt(per * (v.num_images || 1))}`;
+}
+
 const CALCS = {
   Seedance2TextToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
   Seedance2ImageToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
@@ -81,6 +93,7 @@ const CALCS = {
   Seedance15ProImageToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   GPTImage2TextToImage_fal: gptCost,
   GPTImage2Edit_fal: gptCost,
+  NanoBananaEdit_fal: nanoBananaCost,
 };
 
 app.registerExtension({

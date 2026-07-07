@@ -1036,6 +1036,102 @@ class Seedance15ProImageToVideo:
 
 
 # ---------------------------------------------------------------------------
+# Nano Banana (Google) — Edit
+# ---------------------------------------------------------------------------
+
+NB_MODELS = {
+    "nano-banana-2": "fal-ai/nano-banana-2/edit",
+    "nano-banana-pro": "fal-ai/nano-banana-pro/edit",
+}
+NB_ASPECTS = ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1",
+              "4:5", "3:4", "2:3", "9:16"]
+NB_RESOLUTIONS = ["1K", "0.5K", "2K", "4K"]
+
+# $ за изображение: базовая цена и множители по разрешению
+_NB_PRICE = {
+    "nano-banana-2": {"0.5K": 0.06, "1K": 0.08, "2K": 0.12, "4K": 0.16},
+    "nano-banana-pro": {"0.5K": 0.15, "1K": 0.15, "2K": 0.15, "4K": 0.30},
+}
+
+
+class NanoBananaEdit:
+    """Редактирование/композиция картинок моделями Google Nano Banana 2 /
+    Nano Banana Pro через fal. До 4 референсов сокетами + список URL.
+    В промпте можно ссылаться на референсы по порядку подачи."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_1": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "model": (list(NB_MODELS), {"default": "nano-banana-2"}),
+                "resolution": (NB_RESOLUTIONS, {"default": "1K"}),
+                "aspect_ratio": (NB_ASPECTS, {"default": "auto"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "thinking_level": (["off", "minimal", "high"], {
+                    "default": "off",
+                    "tooltip": "Только nano-banana-2; high +$0.002/запрос"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "image_urls", "description")
+    FUNCTION = "generate"
+    CATEGORY = "fal/Nano Banana"
+
+    def generate(self, image_1, prompt, model, resolution, aspect_ratio,
+                 num_images, image_2=None, image_3=None, image_4=None,
+                 system_prompt="", thinking_level="off", seed=-1,
+                 extra_image_urls=""):
+        _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                urls += _upload_image_input(img, 14 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 14 - len(urls))
+
+        # 0.5K поддерживает только nano-banana-2
+        if model == "nano-banana-pro" and resolution == "0.5K":
+            resolution = "1K"
+
+        args = {
+            "prompt": prompt,
+            "image_urls": urls,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "num_images": num_images,
+            "output_format": "png",
+        }
+        if system_prompt.strip():
+            args["system_prompt"] = system_prompt
+        if model == "nano-banana-2" and thinking_level != "off":
+            args["thinking_level"] = thinking_level
+        _seed_arg(args, seed)
+
+        price = _NB_PRICE[model].get(resolution, 0.08) * num_images
+        endpoint = NB_MODELS[model]
+        print(f"[fal {endpoint}] ориентировочная стоимость: ~${price:.2f} "
+              f"({num_images} шт, {resolution})")
+        result = _run_request(endpoint, args, est_seconds=30 * num_images)
+        img_urls = [i["url"] for i in (result or {}).get("images", [])
+                    if i.get("url")]
+        if not img_urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        tensor = _download_images_as_tensor(img_urls)
+        return (tensor, "\n".join(img_urls),
+                (result or {}).get("description", "") or "")
+
+
+# ---------------------------------------------------------------------------
 # Topaz Video Upscale
 # ---------------------------------------------------------------------------
 
@@ -1141,6 +1237,7 @@ NODE_CLASS_MAPPINGS = {
     "GPTImage2TextToImage_fal": GPTImage2TextToImage,
     "GPTImage2Edit_fal": GPTImage2Edit,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
+    "NanoBananaEdit_fal": NanoBananaEdit,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1152,4 +1249,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
+    "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
 }
