@@ -739,6 +739,10 @@ def _run_gpt_image(endpoint, args):
 
 
 class GPTImage2TextToImage:
+    """Универсальная нода GPT Image 2. Без подключённых картинок — чистый
+    text-to-image. Если подключены image_1..image_4 / mask / extra_image_urls —
+    нода автоматически использует edit-эндпоинт (референсы + инпейнт)."""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -749,6 +753,12 @@ class GPTImage2TextToImage:
                 "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
             },
             "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "mask": ("MASK",),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
                 "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
                 "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
             },
@@ -760,8 +770,16 @@ class GPTImage2TextToImage:
     CATEGORY = "fal/GPT Image"
 
     def generate(self, prompt, image_size, quality, num_images,
+                 image_1=None, image_2=None, image_3=None, image_4=None,
+                 mask=None, extra_image_urls="",
                  custom_width=0, custom_height=0):
         _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                urls += _upload_image_input(img, 16 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 16 - len(urls))
+
         args = {
             "prompt": prompt,
             "image_size": _gpt_image_size(image_size, custom_width, custom_height),
@@ -769,6 +787,16 @@ class GPTImage2TextToImage:
             "num_images": num_images,
             "output_format": "png",
         }
+        if urls:  # есть референсы -> edit-эндпоинт
+            args["image_urls"] = urls
+            if mask is not None:
+                args["mask_url"] = _mask_to_url(mask)
+            return _run_gpt_image("openai/gpt-image-2/edit", args)
+        if mask is not None:
+            raise RuntimeError(
+                "Маска подключена, но нет ни одной картинки: для инпейнта "
+                "подключи изображение в image_1."
+            )
         return _run_gpt_image("openai/gpt-image-2", args)
 
 
@@ -927,6 +955,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance2ReferenceToVideo_fal": "Seedance 2.0 Reference-to-Video (fal)",
     "Seedance15ProTextToVideo_fal": "Seedance 1.5 Pro Text-to-Video (fal)",
     "Seedance15ProImageToVideo_fal": "Seedance 1.5 Pro Image-to-Video (fal)",
-    "GPTImage2TextToImage_fal": "GPT Image 2 Text-to-Image (fal)",
+    "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
 }
