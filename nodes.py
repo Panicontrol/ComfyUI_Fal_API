@@ -122,19 +122,26 @@ def _upload_image_input(image_tensor, limit=1):
     return urls
 
 
-def _probe_container_duration(path):
-    """Длительность видео по метаданным контейнера — так его увидит fal."""
+def _probe_video_info(path):
+    """(длительность_с, ширина, высота) по метаданным контейнера — так видео
+    увидит fal. Любое поле может быть None."""
+    dur = w = h = None
     try:
         import av
         with av.open(path) as c:
             if c.duration:
-                return c.duration / 1_000_000.0  # микросекунды
+                dur = c.duration / 1_000_000.0  # микросекунды
             v = c.streams.video[0]
-            if v.duration and v.time_base:
-                return float(v.duration * v.time_base)
+            if dur is None and v.duration and v.time_base:
+                dur = float(v.duration * v.time_base)
+            w, h = v.codec_context.width, v.codec_context.height
     except Exception:
         pass
-    return None
+    return dur, w, h
+
+
+def _probe_container_duration(path):
+    return _probe_video_info(path)[0]
 
 
 def _ffmpeg_exe():
@@ -233,13 +240,13 @@ def _reencode_video(src_path):
     )
 
 
-def _upload_video_input(video, label="видео"):
+def _upload_video_input(video, label="видео", min_duration=2.0):
     """VIDEO-вход ComfyUI -> URL в fal storage.
 
-    Видео всегда перекодируется перед загрузкой (лечит битые тайм-метки).
-    Возвращает (url, длительность_с | None)."""
+    Здоровые файлы грузятся как есть; если метаданные контейнера битые
+    (Unreal/NLE) — видео перекодируется. Возвращает (url, dur, w, h)."""
     if isinstance(video, str) and video.lower().startswith(("http://", "https://")):
-        return video, None
+        return video, None, None, None
 
     # получаем локальный файл-источник
     src, tmp_src = None, None
@@ -263,20 +270,25 @@ def _upload_video_input(video, label="видео"):
 
     tmp_enc = None
     try:
-        try:
-            tmp_enc, dur = _reencode_video(src)
-            upload_path = tmp_enc
-        except ImportError:
-            upload_path, dur = src, None  # нет PyAV — грузим как есть
-        if dur is not None:
-            print(f"[fal] {label}: {dur:.2f} с после перекодировки")
-            if dur < 2.0:
-                raise RuntimeError(
-                    f"Референс-{label} слишком короткое: {dur:.2f} с "
-                    f"(fal требует 2–15 с суммарно). Похоже, в видео-вход "
-                    f"попал одиночный кадр — подключи полноценный ролик."
-                )
-        return fal_client.upload_file(upload_path), dur
+        dur, w, h = _probe_video_info(src)
+        if dur is not None and dur > 0.5:
+            # контейнер здоровый — грузим оригинал без перекодировки
+            print(f"[fal] {label}: {dur:.2f} с, {w}x{h} (без перекодировки)")
+        else:
+            try:
+                tmp_enc, dur = _reencode_video(src)
+                _, w, h = _probe_video_info(tmp_enc)
+                src = tmp_enc
+                print(f"[fal] {label}: {dur:.2f} с после перекодировки")
+            except ImportError:
+                dur = None  # нет PyAV — грузим как есть
+        if min_duration and dur is not None and dur < min_duration:
+            raise RuntimeError(
+                f"Референс-{label} слишком короткое: {dur:.2f} с "
+                f"(fal требует 2–15 с суммарно). Похоже, в видео-вход "
+                f"попал одиночный кадр — подключи полноценный ролик."
+            )
+        return fal_client.upload_file(src), dur, w, h
     finally:
         for p in (tmp_src, tmp_enc):
             if p:
@@ -731,7 +743,7 @@ class Seedance2ReferenceToVideo:
         vid_urls, vid_total = [], 0.0
         for i, vid in enumerate((video_1, video_2, video_3), 1):
             if vid is not None and len(vid_urls) < 3:
-                url, d = _upload_video_input(vid, label=f"video_{i}")
+                url, d, _, _ = _upload_video_input(vid, label=f"video_{i}")
                 if d:
                     vid_total += d
                 vid_urls.append(url)
@@ -1023,6 +1035,103 @@ class Seedance15ProImageToVideo:
                        "seedance15_i2v")
 
 
+# ---------------------------------------------------------------------------
+# Topaz Video Upscale
+# ---------------------------------------------------------------------------
+
+TOPAZ_MODELS = ["Proteus", "Artemis HQ", "Artemis MQ", "Artemis LQ",
+                "Nyx", "Nyx Fast", "Nyx XL", "Nyx HF",
+                "Gaia HQ", "Gaia CG", "Gaia 2",
+                "Starlight Precise 1", "Starlight Precise 2",
+                "Starlight Precise 2.5", "Starlight HQ", "Starlight Mini",
+                "Starlight Sharp", "Starlight Fast 1", "Starlight Fast 2"]
+
+# Тумблер тонких настроек: -1 = не отправлять (fal возьмёт дефолт модели)
+_TOPAZ_TUNE = ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                         "tooltip": "-1 = дефолт выбранной модели"})
+
+
+def _topaz_cost_text(dur, w, h, factor, target_fps, model):
+    if not dur or not w or not h:
+        return "оценка недоступна (не удалось прочитать метаданные)"
+    out_h = h * factor
+    if out_h <= 720:
+        per_sec = 0.01
+    elif out_h <= 1080:
+        per_sec = 0.02
+    else:
+        per_sec = 0.08
+    if target_fps and target_fps >= 60:
+        per_sec *= 2
+    if model == "Gaia 2":
+        per_sec /= 2
+    return (f"~${dur * per_sec:.2f} "
+            f"({dur:.1f} с, выход ~{int(w*factor)}x{int(out_h)})")
+
+
+class TopazVideoUpscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "model": (TOPAZ_MODELS, {"default": "Proteus"}),
+                "upscale_factor": ("FLOAT", {"default": 2.0, "min": 1.0,
+                                             "max": 8.0, "step": 0.5}),
+                "H264_output": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "H264 совместимее (превью в браузере); "
+                               "false = H265, меньше размер"}),
+            },
+            "optional": {
+                "target_fps": ("INT", {
+                    "default": 0, "min": 0, "max": 120,
+                    "tooltip": "0 = не интерполировать кадры; "
+                               ">0 = включить интерполяцию до этого fps"}),
+                "compression": _TOPAZ_TUNE,
+                "noise": _TOPAZ_TUNE,
+                "halo": _TOPAZ_TUNE,
+                "grain": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.1,
+                                    "step": 0.01,
+                                    "tooltip": "-1 = дефолт модели"}),
+                "recover_detail": _TOPAZ_TUNE,
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Topaz"
+
+    def upscale(self, video, model, upscale_factor, H264_output,
+                target_fps=0, compression=-1.0, noise=-1.0, halo=-1.0,
+                grain=-1.0, recover_detail=-1.0):
+        _require_deps()
+        url, dur, w, h = _upload_video_input(video, label="видео для апскейла",
+                                             min_duration=None)
+        print(f"[fal fal-ai/topaz/upscale/video] ориентировочная стоимость: "
+              f"{_topaz_cost_text(dur, w, h, upscale_factor, target_fps, model)}")
+        args = {
+            "video_url": url,
+            "model": model,
+            "upscale_factor": upscale_factor,
+            "H264_output": H264_output,
+        }
+        if target_fps and target_fps > 0:
+            args["target_fps"] = target_fps
+        for name, val in (("compression", compression), ("noise", noise),
+                          ("halo", halo), ("grain", grain),
+                          ("recover_detail", recover_detail)):
+            if val is not None and val >= 0:
+                args[name] = val
+        est = 60 + (dur or 10) * 15
+        result = _run_request("fal-ai/topaz/upscale/video", args, est)
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(out["url"], "topaz_upscale")
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -1031,6 +1140,7 @@ NODE_CLASS_MAPPINGS = {
     "Seedance15ProImageToVideo_fal": Seedance15ProImageToVideo,
     "GPTImage2TextToImage_fal": GPTImage2TextToImage,
     "GPTImage2Edit_fal": GPTImage2Edit,
+    "TopazVideoUpscale_fal": TopazVideoUpscale,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1041,4 +1151,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance15ProImageToVideo_fal": "Seedance 1.5 Pro Image-to-Video (fal)",
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
+    "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
 }
