@@ -1036,6 +1036,86 @@ class Seedance15ProImageToVideo:
 
 
 # ---------------------------------------------------------------------------
+# Qwen Image Max (Alibaba)
+# ---------------------------------------------------------------------------
+
+QWEN_SIZES = ["square_hd", "square", "portrait_4_3", "portrait_16_9",
+              "landscape_4_3", "landscape_16_9"]
+_QWEN_PRICE = 0.075  # $ за изображение
+
+
+class QwenImageMax:
+    """Qwen Image Max: без картинок — text-to-image, с подключёнными
+    image_1..image_3 — edit (инструкции по референсам, до 3 картинок).
+    Промпт до 800 символов, поддерживает русский/английский/китайский."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (QWEN_SIZES, {"default": "landscape_16_9"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "enable_prompt_expansion": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "LLM-дораскрытие промпта на стороне Qwen"}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/Qwen"
+
+    def generate(self, prompt, image_size, num_images, enable_prompt_expansion,
+                 image_1=None, image_2=None, image_3=None, negative_prompt="",
+                 seed=-1, custom_width=0, custom_height=0, extra_image_urls=""):
+        _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3):
+            if img is not None and len(urls) < 3:
+                urls += _upload_image_input(img, 3 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 3 - len(urls))
+
+        size = ({"width": custom_width, "height": custom_height}
+                if custom_width > 0 and custom_height > 0 else image_size)
+        args = {
+            "prompt": prompt[:800],
+            "image_size": size,
+            "num_images": num_images,
+            "enable_prompt_expansion": enable_prompt_expansion,
+            "output_format": "png",
+        }
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt[:500]
+        _seed_arg(args, seed)
+
+        if urls:
+            args["image_urls"] = urls
+            endpoint = "fal-ai/qwen-image-max/edit"
+        else:
+            endpoint = "fal-ai/qwen-image-max/text-to-image"
+        print(f"[fal {endpoint}] ориентировочная стоимость: "
+              f"~${_QWEN_PRICE * num_images:.3f} ({num_images} шт)")
+        result = _run_request(endpoint, args, est_seconds=30 * num_images)
+        img_urls = [i["url"] for i in (result or {}).get("images", [])
+                    if i.get("url")]
+        if not img_urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(img_urls), "\n".join(img_urls)
+
+
+# ---------------------------------------------------------------------------
 # Nano Banana (Google) — Edit
 # ---------------------------------------------------------------------------
 
@@ -1238,6 +1318,7 @@ NODE_CLASS_MAPPINGS = {
     "GPTImage2Edit_fal": GPTImage2Edit,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "NanoBananaEdit_fal": NanoBananaEdit,
+    "QwenImageMax_fal": QwenImageMax,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1250,4 +1331,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
+    "QwenImageMax_fal": "Qwen Image Max (fal)",
 }

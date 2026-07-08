@@ -94,6 +94,7 @@ const CALCS = {
   GPTImage2TextToImage_fal: gptCost,
   GPTImage2Edit_fal: gptCost,
   NanoBananaEdit_fal: nanoBananaCost,
+  QwenImageMax_fal: (v) => `≈ ${fmt(0.075 * (v.num_images || 1))}`,
 };
 
 app.registerExtension({
