@@ -718,6 +718,11 @@ class Seedance2ReferenceToVideo:
                 "audio_refs": ("STRING", {"multiline": True, "default": ""}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
                 "duration_override": DURATION_OVERRIDE_INPUT,
+                # в конце списка, чтобы не сдвигать виджеты сохранённых нод
+                "fast_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Fast-тир: ~$0.24/с вместо ~$0.30/с, быстрее, "
+                               "но максимум 720p"}),
             },
         }
 
@@ -731,8 +736,12 @@ class Seedance2ReferenceToVideo:
                  video_1=None, video_2=None, video_3=None,
                  audio_1=None, audio_2=None, audio_3=None,
                  image_urls="", video_refs="", audio_refs="",
-                 duration_override=0.0, seed=-1):
+                 duration_override=0.0, seed=-1, fast_mode=False):
         _require_deps()
+        if fast_mode and resolution == "1080p":
+            print("[fal] fast-тир reference-to-video поддерживает максимум "
+                  "720p — понижаю разрешение")
+            resolution = "720p"
 
         img_urls = []
         for img in (image_1, image_2, image_3, image_4):
@@ -774,8 +783,9 @@ class Seedance2ReferenceToVideo:
         if aud_urls:
             args["audio_urls"] = aud_urls
         _seed_arg(args, seed)
-        return _finish(_run("bytedance/seedance-2.0/reference-to-video", args),
-                       "seedance2_ref")
+        endpoint = ("bytedance/seedance-2.0/fast/reference-to-video"
+                    if fast_mode else "bytedance/seedance-2.0/reference-to-video")
+        return _finish(_run(endpoint, args), "seedance2_ref")
 
 
 # ---------------------------------------------------------------------------
