@@ -360,6 +360,15 @@ def _run_request(endpoint, arguments, est_seconds=120):
         msgs = re.findall(r"['\"]msg['\"]:\s*['\"]([^'\"]+)['\"]", s)
         return "; ".join(msgs) if msgs else s
 
+    def _is_transient(exc):
+        """Временный сбой на стороне fal — есть смысл повторить."""
+        s = str(exc).lower()
+        return any(t in s for t in (
+            "downstream_service_unavailable", "downstream service unavailable",
+            "502", "503", "504", "gateway timeout", "service unavailable",
+            "bad gateway", "timed out", "timeout", "connection",
+        ))
+
     try:
         from comfy.utils import ProgressBar
         pbar = ProgressBar(100)
@@ -383,6 +392,8 @@ def _run_request(endpoint, arguments, est_seconds=120):
     percent_re = re.compile(r"(\d{1,3})\s*%")
     log_percent = 0
     last_queue_pos = None
+    transient_hits = 0
+    MAX_TRANSIENT = 8  # переживаем ~кратковременные сбои шлюза fal
 
     while True:
         # реагируем на Cancel в ComfyUI
@@ -397,7 +408,19 @@ def _run_request(endpoint, arguments, est_seconds=120):
                     pass
                 raise
 
-        status = handler.status(with_logs=True)
+        try:
+            status = handler.status(with_logs=True)
+            transient_hits = 0
+        except Exception as e:
+            if _is_transient(e) and transient_hits < MAX_TRANSIENT:
+                transient_hits += 1
+                wait = min(30, 3 * transient_hits)
+                print(f"[fal {endpoint}] временный сбой fal "
+                      f"({_fal_error_text(e)}), повтор {transient_hits}/"
+                      f"{MAX_TRANSIENT} через {wait} с")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"fal вернул ошибку: {_fal_error_text(e)}") from e
         status_name = type(status).__name__
 
         for log in (getattr(status, "logs", None) or []):
@@ -423,10 +446,22 @@ def _run_request(endpoint, arguments, est_seconds=120):
             set_progress(max(estimated, log_percent))
         time.sleep(2)
 
-    try:
-        result = handler.get()
-    except Exception as e:
-        raise RuntimeError(f"fal вернул ошибку: {_fal_error_text(e)}") from e
+    # получаем результат — с повтором на временных сбоях шлюза
+    # (задача уже посчитана на fal, разовый 504 не должен её терять)
+    result = None
+    for attempt in range(MAX_TRANSIENT):
+        try:
+            result = handler.get()
+            break
+        except Exception as e:
+            if _is_transient(e) and attempt < MAX_TRANSIENT - 1:
+                wait = min(30, 3 * (attempt + 1))
+                print(f"[fal {endpoint}] временный сбой при получении "
+                      f"результата ({_fal_error_text(e)}), повтор "
+                      f"{attempt + 1}/{MAX_TRANSIENT} через {wait} с")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"fal вернул ошибку: {_fal_error_text(e)}") from e
     if pbar is not None:
         pbar.update_absolute(100, 100)
     return result
