@@ -1369,6 +1369,9 @@ def _lora_choices():
         return ["none"]
 
 
+_FAL_LORA_LIMIT = 1024 ** 3  # fal не принимает LoRA больше 1 ГБ
+
+
 def _upload_lora(ref):
     """ref — URL или локальный путь к .safetensors. URL возвращается как есть,
     локальный файл грузится в fal storage (с кэшем по mtime/размеру)."""
@@ -1377,6 +1380,15 @@ def _upload_lora(ref):
     if not os.path.isfile(ref):
         raise RuntimeError(f"Файл LoRA не найден и это не URL: {ref}")
     st = os.stat(ref)
+    # проверяем лимит fal ДО долгой загрузки
+    if st.st_size > _FAL_LORA_LIMIT:
+        raise RuntimeError(
+            f"LoRA {os.path.basename(ref)} весит {st.st_size / 1024**3:.2f} ГБ — "
+            f"fal не принимает LoRA больше 1 ГБ. Похоже, это не обычная LoRA, "
+            f"а полный файн-тюн или очень высокий ранг. Уменьши ранг при "
+            f"обучении, сконвертируй в fp16/квантуй, либо используй LoRA "
+            f"поменьше. (Проверка до загрузки — время и трафик не потрачены.)"
+        )
     key = (os.path.abspath(ref), int(st.st_mtime), st.st_size)
     if key in _LORA_URL_CACHE:
         return _LORA_URL_CACHE[key]
