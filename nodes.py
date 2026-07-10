@@ -1081,6 +1081,90 @@ class Seedance15ProImageToVideo:
 
 
 # ---------------------------------------------------------------------------
+# Seedream 5.0 Pro (ByteDance)
+# ---------------------------------------------------------------------------
+
+SEEDREAM_SIZES = ["auto_2K", "auto_1K", "square_hd", "square",
+                  "portrait_4_3", "portrait_16_9", "landscape_4_3",
+                  "landscape_16_9"]
+
+
+def _seedream_cost(size, cw, ch, num_images, n_inputs=0):
+    """Seedream 5 Pro: ≤1536² — $0.0675, до 2048² — $0.135; edit +$0.0045/вход."""
+    if cw > 0 and ch > 0:
+        big = cw * ch > 1536 * 1536
+    else:
+        big = size == "auto_2K"
+    per = (0.135 if big else 0.0675) + 0.0045 * n_inputs
+    return per * num_images
+
+
+class SeedreamV5Pro:
+    """Seedream 5.0 Pro (ByteDance) через fal. Без картинок — text-to-image,
+    с подключёнными image_1..image_4 / extra_image_urls — edit (до 10 референсов)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (SEEDREAM_SIZES, {"default": "auto_2K"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/Seedream"
+
+    def generate(self, prompt, image_size, num_images, image_1=None, image_2=None,
+                 image_3=None, image_4=None, custom_width=0, custom_height=0,
+                 seed=-1, extra_image_urls=""):
+        _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None and len(urls) < 10:
+                urls += _upload_image_input(img, 10 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 10 - len(urls))
+
+        size = ({"width": custom_width, "height": custom_height}
+                if custom_width > 0 and custom_height > 0 else image_size)
+        args = {
+            "prompt": prompt,
+            "image_size": size,
+            "num_images": num_images,
+            "output_format": "png",
+        }
+        _seed_arg(args, seed)
+        if urls:
+            args["image_urls"] = urls
+            endpoint = "bytedance/seedream/v5/pro/edit"
+        else:
+            endpoint = "bytedance/seedream/v5/pro/text-to-image"
+        cost = _seedream_cost(image_size, custom_width, custom_height,
+                              num_images, len(urls))
+        print(f"[fal {endpoint}] ориентировочная стоимость: ~${cost:.3f} "
+              f"({num_images} шт, референсов: {len(urls)})")
+        result = _run_request(endpoint, args, est_seconds=25 * num_images)
+        img_urls = [i["url"] for i in (result or {}).get("images", [])
+                    if i.get("url")]
+        if not img_urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(img_urls), "\n".join(img_urls)
+
+
+# ---------------------------------------------------------------------------
 # Qwen Image Max (Alibaba)
 # ---------------------------------------------------------------------------
 
@@ -1793,6 +1877,7 @@ NODE_CLASS_MAPPINGS = {
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "NanoBananaEdit_fal": NanoBananaEdit,
     "QwenImageMax_fal": QwenImageMax,
+    "SeedreamV5Pro_fal": SeedreamV5Pro,
     "FluxLoraImage_fal": FluxLoraImage,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
@@ -1810,6 +1895,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
+    "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
     "FluxLoraImage_fal": "FLUX LoRA (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",

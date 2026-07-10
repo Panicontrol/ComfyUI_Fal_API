@@ -95,6 +95,12 @@ const CALCS = {
   GPTImage2Edit_fal: gptCost,
   NanoBananaEdit_fal: nanoBananaCost,
   QwenImageMax_fal: (v) => `≈ ${fmt(0.075 * (v.num_images || 1))}`,
+  SeedreamV5Pro_fal: (v) => {
+    const big = (v.custom_width > 0 && v.custom_height > 0)
+      ? v.custom_width * v.custom_height > 1536 * 1536
+      : v.image_size === "auto_2K";
+    return `≈ ${fmt((big ? 0.135 : 0.0675) * (v.num_images || 1))}`;
+  },
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);
