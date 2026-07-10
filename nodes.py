@@ -1448,6 +1448,141 @@ def _img_size(preset, cw, ch):
     return {"width": cw, "height": ch} if cw > 0 and ch > 0 else preset
 
 
+class LoraConvert:
+    """Локальный конвертер LoRA (без fal): кастует веса в fp16/bf16 и по желанию
+    снижает ранг через SVD, чтобы уложиться в лимит fal (1 ГБ). Поддерживает
+    kohya (lora_down/lora_up/alpha) и PEFT (lora_A/lora_B, adapter_model.safetensors).
+    Результат сохраняется в models/loras; путь можно скормить в lora_*_url."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora": (_lora_choices(), {"default": "none"}),
+                "dtype": (["fp16", "bf16"], {"default": "fp16"}),
+                "target_rank": ("INT", {
+                    "default": 0, "min": 0, "max": 320,
+                    "tooltip": "0 = не трогать ранг (только fp16). "
+                               ">0 = снизить ранг линейных слоёв через SVD"}),
+            },
+            "optional": {
+                "lora_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Путь к .safetensors; перекрывает выбор из списка"}),
+                "output_name": ("STRING", {
+                    "default": "",
+                    "tooltip": "Имя результата без пути; пусто = авто"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("lora_path",)
+    FUNCTION = "convert"
+    CATEGORY = "fal/LoRA"
+    OUTPUT_NODE = True
+
+    # (down_suffix, up_suffix, alpha_suffix|None)
+    _PAIRS = [(".lora_down.weight", ".lora_up.weight", ".alpha"),
+              (".lora_A.weight", ".lora_B.weight", None)]
+
+    def _reduce(self, down, up, target_rank):
+        import torch
+        if down.dim() != 2 or up.dim() != 2:
+            return down, up, down.shape[0], False  # conv/4D — не трогаем
+        r = down.shape[0]
+        if target_rank <= 0 or target_rank >= r:
+            return down, up, r, False
+        M = up.float() @ down.float()                 # [out, in]
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+        r2 = min(target_rank, S.shape[0])
+        s = torch.sqrt(S[:r2])
+        up2 = (U[:, :r2] * s.unsqueeze(0))            # [out, r2]
+        down2 = (s.unsqueeze(1) * Vh[:r2, :])         # [r2, in]
+        return down2, up2, r2, True
+
+    def convert(self, lora, dtype, target_rank, lora_path="", output_name=""):
+        import torch
+        from safetensors.torch import load_file, save_file
+
+        src = lora_path.strip()
+        if not src:
+            if not lora or lora == "none":
+                raise RuntimeError("Не выбрана LoRA: укажи файл в списке или lora_path")
+            import folder_paths
+            src = folder_paths.get_full_path("loras", lora) or lora
+        if not os.path.isfile(src):
+            raise RuntimeError(f"Файл LoRA не найден: {src}")
+
+        state = load_file(src)
+        keys = set(state.keys())
+        td = torch.float16 if dtype == "fp16" else torch.bfloat16
+        reduced_pairs = 0
+
+        if target_rank > 0:
+            for down_sfx, up_sfx, alpha_sfx in self._PAIRS:
+                for k in list(keys):
+                    if not k.endswith(down_sfx):
+                        continue
+                    prefix = k[: -len(down_sfx)]
+                    up_key = prefix + up_sfx
+                    if up_key not in state:
+                        continue
+                    old_r = int(state[k].shape[0])  # до замены!
+                    down2, up2, r2, changed = self._reduce(
+                        state[k], state[up_key], target_rank)
+                    if not changed:
+                        continue
+                    state[k] = down2
+                    state[up_key] = up2
+                    reduced_pairs += 1
+                    # kohya: alpha/rank должен остаться прежним
+                    if alpha_sfx:
+                        ak = prefix + alpha_sfx
+                        if ak in state:
+                            state[ak] = (state[ak].float() * r2 / old_r)
+
+        # каст всех float-тензоров в целевой тип
+        for k in list(state.keys()):
+            if state[k].is_floating_point():
+                state[k] = state[k].to(td).contiguous()
+
+        loras_dir = self._loras_dir()
+        base = os.path.splitext(os.path.basename(src))[0]
+        if output_name.strip():
+            out_name = output_name.strip()
+            if not out_name.endswith(".safetensors"):
+                out_name += ".safetensors"
+        else:
+            tag = f"_{dtype}" + (f"_rank{target_rank}" if reduced_pairs else "")
+            out_name = f"{base}{tag}.safetensors"
+        out_path = os.path.join(loras_dir, out_name)
+        save_file(state, out_path)
+
+        new_size = os.path.getsize(out_path)
+        old_size = os.path.getsize(src)
+        print(f"[LoRA convert] {os.path.basename(src)} "
+              f"{old_size/1024**2:.0f} МБ -> {out_name} {new_size/1024**2:.0f} МБ "
+              f"({dtype}, слоёв со сниженным рангом: {reduced_pairs})")
+        if new_size > _FAL_LORA_LIMIT:
+            print(f"[LoRA convert] ВНИМАНИЕ: результат всё ещё > 1 ГБ — "
+                  f"снизь target_rank (например 32–64)")
+        return (out_path,)
+
+    @staticmethod
+    def _loras_dir():
+        try:
+            import folder_paths
+            dirs = folder_paths.get_folder_paths("loras")
+            if dirs:
+                os.makedirs(dirs[0], exist_ok=True)
+                return dirs[0]
+        except Exception:
+            pass
+        d = os.path.join(tempfile.gettempdir(), "loras_out")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+
 class FluxLoraImage:
     """FLUX.1 [dev] с пользовательскими LoRA. Без картинки — text-to-image,
     с подключённой image — image-to-image."""
@@ -1661,6 +1796,7 @@ NODE_CLASS_MAPPINGS = {
     "FluxLoraImage_fal": FluxLoraImage,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
+    "LoraConvert_fal": LoraConvert,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1677,4 +1813,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxLoraImage_fal": "FLUX LoRA (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
+    "LoraConvert_fal": "LoRA Convert fp16 / уменьшить ранг",
 }
