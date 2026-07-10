@@ -95,6 +95,14 @@ const CALCS = {
   GPTImage2Edit_fal: gptCost,
   NanoBananaEdit_fal: nanoBananaCost,
   QwenImageMax_fal: (v) => `≈ ${fmt(0.075 * (v.num_images || 1))}`,
+  IdeogramImage_fal: (v) => {
+    const rate = { TURBO: 0.03, BALANCED: 0.06, QUALITY: 0.10 }[v.rendering_speed] ?? 0.06;
+    const mp = (v.custom_width > 0 && v.custom_height > 0)
+      ? (v.custom_width * v.custom_height) / 1e6 : 1.0;
+    let c = rate * mp * (v.num_images || 1);
+    if (v.enable_prompt_expansion) c += 0.03;
+    return `≈ ${fmt(c)}`;
+  },
   SeedreamV5Pro_fal: (v) => {
     const big = (v.custom_width > 0 && v.custom_height > 0)
       ? v.custom_width * v.custom_height > 1536 * 1536

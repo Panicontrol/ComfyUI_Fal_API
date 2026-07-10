@@ -1081,6 +1081,115 @@ class Seedance15ProImageToVideo:
 
 
 # ---------------------------------------------------------------------------
+# Ideogram (V4 text-to-image, V3 edit/inpaint)
+# ---------------------------------------------------------------------------
+
+IDEOGRAM_SIZES = ["square_hd", "square", "portrait_4_3", "portrait_16_9",
+                  "landscape_4_3", "landscape_16_9"]
+IDEOGRAM_SPEED = ["BALANCED", "TURBO", "QUALITY"]
+_IDEOGRAM_RATE = {"TURBO": 0.03, "BALANCED": 0.06, "QUALITY": 0.10}  # $ за МП
+
+
+def _mask_to_bw_url(mask):
+    """MASK ComfyUI (B,H,W, 1=зона правки) -> ч/б RGB PNG, белое = править."""
+    arr = mask.cpu().numpy() if hasattr(mask, "cpu") else np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[0]
+    g = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+    rgb = np.stack([g, g, g], axis=-1)
+    return _upload_pil(Image.fromarray(rgb, mode="RGB"))
+
+
+def _ideogram_cost(size, cw, ch, speed, num_images, expand):
+    mp = (cw * ch / 1e6) if (cw > 0 and ch > 0) else 1.0  # пресеты ~1 МП
+    cost = _IDEOGRAM_RATE.get(speed, 0.06) * mp * num_images
+    if expand:
+        cost += 0.03
+    return cost
+
+
+class IdeogramImage:
+    """Ideogram через fal. Без картинки — text-to-image (V4). С подключёнными
+    image + mask — инпейнт/редактирование (V3 edit): белое на маске = зона правки."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (IDEOGRAM_SIZES, {"default": "square_hd"}),
+                "rendering_speed": (IDEOGRAM_SPEED, {"default": "BALANCED"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 8}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "enable_prompt_expansion": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "MagicPrompt — дораскрытие промпта (+$0.03)"}),
+                "style_preset": ("STRING", {
+                    "default": "",
+                    "tooltip": "Только для edit (V3): напр. OIL_PAINTING, "
+                               "WATERCOLOR, POP_ART; пусто = без пресета"}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/Ideogram"
+
+    def generate(self, prompt, image_size, rendering_speed, num_images,
+                 image=None, mask=None, enable_prompt_expansion=True,
+                 style_preset="", custom_width=0, custom_height=0, seed=-1):
+        _require_deps()
+        if image is not None:
+            if mask is None:
+                raise RuntimeError(
+                    "Для редактирования Ideogram (V3 edit) нужна маска: подключи "
+                    "MASK (белое = зона, которую перерисовать). Без картинки — "
+                    "это text-to-image V4.")
+            args = {
+                "prompt": prompt,
+                "image_url": _upload_image_input(image, 1)[0],
+                "mask_url": _mask_to_bw_url(mask),
+                "rendering_speed": rendering_speed,
+                "num_images": num_images,
+                "expand_prompt": enable_prompt_expansion,
+            }
+            if style_preset.strip():
+                args["style_preset"] = style_preset.strip()
+            _seed_arg(args, seed)
+            endpoint = "fal-ai/ideogram/v3/edit"
+        else:
+            size = ({"width": custom_width, "height": custom_height}
+                    if custom_width > 0 and custom_height > 0 else image_size)
+            args = {
+                "prompt": prompt,
+                "image_size": size,
+                "rendering_speed": rendering_speed,
+                "num_images": num_images,
+                "enable_prompt_expansion": enable_prompt_expansion,
+                "output_format": "png",
+            }
+            _seed_arg(args, seed)
+            endpoint = "ideogram/v4"
+        cost = _ideogram_cost(image_size, custom_width, custom_height,
+                              rendering_speed, num_images, enable_prompt_expansion)
+        print(f"[fal {endpoint}] ориентировочная стоимость: ~${cost:.3f} "
+              f"({num_images} шт, {rendering_speed})")
+        result = _run_request(endpoint, args, est_seconds=15 * num_images)
+        img_urls = [i["url"] for i in (result or {}).get("images", [])
+                    if i.get("url")]
+        if not img_urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(img_urls), "\n".join(img_urls)
+
+
+# ---------------------------------------------------------------------------
 # Seedream 5.0 Pro (ByteDance)
 # ---------------------------------------------------------------------------
 
@@ -1878,6 +1987,7 @@ NODE_CLASS_MAPPINGS = {
     "NanoBananaEdit_fal": NanoBananaEdit,
     "QwenImageMax_fal": QwenImageMax,
     "SeedreamV5Pro_fal": SeedreamV5Pro,
+    "IdeogramImage_fal": IdeogramImage,
     "FluxLoraImage_fal": FluxLoraImage,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
@@ -1896,6 +2006,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
+    "IdeogramImage_fal": "Ideogram V4 / V3 Edit (fal)",
     "FluxLoraImage_fal": "FLUX LoRA (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
