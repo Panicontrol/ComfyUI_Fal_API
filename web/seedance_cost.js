@@ -95,6 +95,11 @@ const CALCS = {
   GPTImage2Edit_fal: gptCost,
   NanoBananaEdit_fal: nanoBananaCost,
   QwenImageMax_fal: (v) => `≈ ${fmt(0.075 * (v.num_images || 1))}`,
+  WanLoraVideo_fal: (v) => {
+    const fps = v.frames_per_second || 16;
+    const secs = (v.num_frames || 81) / (fps || 16);
+    return `≈ ${fmt(secs * 0.1)}`;
+  },
 };
 
 app.registerExtension({

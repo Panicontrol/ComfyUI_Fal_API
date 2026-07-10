@@ -1353,6 +1353,288 @@ class TopazVideoUpscale:
         return _finish(out["url"], "topaz_upscale")
 
 
+# ---------------------------------------------------------------------------
+# Модели с поддержкой пользовательских LoRA (FLUX / Wan / Qwen-Image Edit)
+# ---------------------------------------------------------------------------
+
+_LORA_URL_CACHE = {}  # (abspath, mtime, size) -> URL в fal storage
+
+
+def _lora_choices():
+    """Список LoRA из папки ComfyUI/models/loras для выпадающего списка."""
+    try:
+        import folder_paths
+        return ["none"] + list(folder_paths.get_filename_list("loras"))
+    except Exception:
+        return ["none"]
+
+
+def _upload_lora(ref):
+    """ref — URL или локальный путь к .safetensors. URL возвращается как есть,
+    локальный файл грузится в fal storage (с кэшем по mtime/размеру)."""
+    if ref.lower().startswith(("http://", "https://", "data:")):
+        return ref
+    if not os.path.isfile(ref):
+        raise RuntimeError(f"Файл LoRA не найден и это не URL: {ref}")
+    st = os.stat(ref)
+    key = (os.path.abspath(ref), int(st.st_mtime), st.st_size)
+    if key in _LORA_URL_CACHE:
+        return _LORA_URL_CACHE[key]
+    print(f"[fal] загружаю LoRA {os.path.basename(ref)} "
+          f"({st.st_size / 1e6:.0f} МБ) в fal storage — первый раз может занять время")
+    url = fal_client.upload_file(ref)
+    _LORA_URL_CACHE[key] = url
+    return url
+
+
+def _lora_slot_inputs(n=3):
+    """n слотов LoRA для секции optional INPUT_TYPES."""
+    choices = _lora_choices()
+    d = {}
+    for i in range(1, n + 1):
+        d[f"lora_{i}"] = (choices, {"default": "none"})
+        d[f"lora_{i}_url"] = ("STRING", {
+            "default": "",
+            "tooltip": "URL весов (Civitai/HF) или путь к файлу; "
+                       "перекрывает выбор из списка"})
+        d[f"lora_{i}_scale"] = ("FLOAT", {
+            "default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05})
+    return d
+
+
+def _build_loras(kw, n=3, extra=None):
+    """Собирает массив loras из kwargs слотов. extra — доп. поля в каждый
+    элемент (например {'transformer': 'both'} для Wan 2.2)."""
+    out = []
+    for i in range(1, n + 1):
+        name = kw.get(f"lora_{i}", "none")
+        url = (kw.get(f"lora_{i}_url", "") or "").strip()
+        scale = kw.get(f"lora_{i}_scale", 1.0)
+        ref = None
+        if url:
+            ref = url
+        elif name and name != "none":
+            try:
+                import folder_paths
+                ref = folder_paths.get_full_path("loras", name) or name
+            except Exception:
+                ref = name
+        if not ref:
+            continue
+        item = {"path": _upload_lora(ref), "scale": float(scale)}
+        if extra:
+            item.update(extra)
+        out.append(item)
+    return out
+
+
+IMG_SIZES = ["landscape_16_9", "landscape_4_3", "square_hd", "square",
+             "portrait_4_3", "portrait_16_9"]
+
+
+def _img_size(preset, cw, ch):
+    return {"width": cw, "height": ch} if cw > 0 and ch > 0 else preset
+
+
+class FluxLoraImage:
+    """FLUX.1 [dev] с пользовательскими LoRA. Без картинки — text-to-image,
+    с подключённой image — image-to-image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "image": ("IMAGE",),
+            "strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0,
+                                   "step": 0.01,
+                                   "tooltip": "Сила для image-to-image"}),
+            "num_inference_steps": ("INT", {"default": 28, "min": 1, "max": 60}),
+            "guidance_scale": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 20.0,
+                                         "step": 0.1}),
+            "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (IMG_SIZES, {"default": "landscape_16_9"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/LoRA"
+
+    def generate(self, prompt, image_size, num_images, image=None, strength=0.85,
+                 num_inference_steps=28, guidance_scale=3.5,
+                 custom_width=0, custom_height=0, seed=-1, **kw):
+        _require_deps()
+        loras = _build_loras(kw, 3)
+        args = {
+            "prompt": prompt,
+            "image_size": _img_size(image_size, custom_width, custom_height),
+            "num_images": num_images,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "output_format": "png",
+        }
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            args["strength"] = strength
+            endpoint = "fal-ai/flux-lora/image-to-image"
+        else:
+            endpoint = "fal-ai/flux-lora"
+        print(f"[fal {endpoint}] LoRA: {len(loras)} шт")
+        result = _run_request(endpoint, args, est_seconds=15 * num_images)
+        urls = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
+        if not urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(urls), "\n".join(urls)
+
+
+class QwenImageEditLora:
+    """Qwen-Image Edit с пользовательскими LoRA (до 3). Редактирование картинки
+    по инструкции — в отличие от закрытой Qwen Image Max, здесь свои LoRA."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            "num_inference_steps": ("INT", {"default": 30, "min": 1, "max": 60}),
+            "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0,
+                                         "step": 0.1}),
+            "acceleration": (["none", "regular", "high"], {"default": "none"}),
+            "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (IMG_SIZES, {"default": "square_hd"}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/LoRA"
+
+    def generate(self, image, prompt, image_size, negative_prompt="",
+                 num_inference_steps=30, guidance_scale=4.0, acceleration="none",
+                 num_images=1, custom_width=0, custom_height=0, seed=-1, **kw):
+        _require_deps()
+        loras = _build_loras(kw, 3)
+        args = {
+            "prompt": prompt,
+            "image_url": _upload_image_input(image, 1)[0],
+            "image_size": _img_size(image_size, custom_width, custom_height),
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "acceleration": acceleration,
+            "num_images": num_images,
+            "output_format": "png",
+        }
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+        print(f"[fal fal-ai/qwen-image-edit-lora] LoRA: {len(loras)} шт")
+        result = _run_request("fal-ai/qwen-image-edit-lora", args,
+                              est_seconds=20 * num_images)
+        urls = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
+        if not urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(urls), "\n".join(urls)
+
+
+class WanLoraVideo:
+    """Wan 2.2 A14B с пользовательскими LoRA. Без картинки — text-to-video,
+    с подключённой image — image-to-video. Цена ~$0.1/сек."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "image": ("IMAGE",),
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            "num_frames": ("INT", {"default": 81, "min": 17, "max": 161}),
+            "frames_per_second": ("INT", {"default": 16, "min": 4, "max": 60}),
+            "num_inference_steps": ("INT", {"default": 27, "min": 1, "max": 50}),
+            "guidance_scale": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 20.0,
+                                         "step": 0.1}),
+            "lora_transformer": (["both", "high", "low"], {
+                "default": "both",
+                "tooltip": "К какому эксперту Wan 2.2 применять LoRA "
+                           "(high/low noise). both — безопаснее для готовых LoRA"}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (["720p", "580p", "480p"], {"default": "720p"}),
+                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/LoRA"
+
+    def generate(self, prompt, resolution, aspect_ratio, image=None,
+                 negative_prompt="", num_frames=81, frames_per_second=16,
+                 num_inference_steps=27, guidance_scale=3.5,
+                 lora_transformer="both", seed=-1, **kw):
+        _require_deps()
+        loras = _build_loras(kw, 3, extra={"transformer": lora_transformer})
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "num_frames": num_frames,
+            "frames_per_second": frames_per_second,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+        }
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            endpoint = "fal-ai/wan/v2.2-a14b/image-to-video/lora"
+        else:
+            args["aspect_ratio"] = aspect_ratio
+            endpoint = "fal-ai/wan/v2.2-a14b/text-to-video/lora"
+        secs = num_frames / max(frames_per_second, 1)
+        print(f"[fal {endpoint}] LoRA: {len(loras)} шт, "
+              f"~{secs:.1f} с видео, ориентировочная стоимость ~${secs * 0.1:.2f}")
+        return _finish(_run_wan(endpoint, args), "wan_lora")
+
+
+def _run_wan(endpoint, args):
+    est = args.get("num_frames", 81) / max(args.get("frames_per_second", 16), 1) * 20 + 30
+    result = _run_request(endpoint, args, est)
+    video = (result or {}).get("video") or {}
+    if not video.get("url"):
+        raise RuntimeError(f"fal не вернул видео: {result}")
+    return video["url"]
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -1364,6 +1646,9 @@ NODE_CLASS_MAPPINGS = {
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "NanoBananaEdit_fal": NanoBananaEdit,
     "QwenImageMax_fal": QwenImageMax,
+    "FluxLoraImage_fal": FluxLoraImage,
+    "QwenImageEditLora_fal": QwenImageEditLora,
+    "WanLoraVideo_fal": WanLoraVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1377,4 +1662,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
+    "FluxLoraImage_fal": "FLUX LoRA (fal)",
+    "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
+    "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
 }
