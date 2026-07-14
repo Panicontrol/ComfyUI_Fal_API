@@ -358,7 +358,16 @@ def _run_request(endpoint, arguments, est_seconds=120):
     def _fal_error_text(exc):
         s = str(exc)
         msgs = re.findall(r"['\"]msg['\"]:\s*['\"]([^'\"]+)['\"]", s)
-        return "; ".join(msgs) if msgs else s
+        text = "; ".join(msgs) if msgs else s
+        low = s.lower()
+        if ("content_policy_violation" in low or "partner_validation_failed" in low
+                or "likeness" in low):
+            text += ("\n  >> Это блокировка модерации провайдера (ByteDance/fal), "
+                     "а не сбой ноды: контент отклонён из-за образа реального "
+                     "человека / переноса личности. Повтор не поможет — модель "
+                     "не обрабатывает такой материал. Используй синтетических "
+                     "персонажей или контент, который проходит их проверку.")
+        return text
 
     def _is_transient(exc):
         """Временный сбой на стороне fal — есть смысл повторить."""
