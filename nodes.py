@@ -1459,6 +1459,90 @@ class NanoBananaEdit:
 
 
 # ---------------------------------------------------------------------------
+# Kling (Kuaishou) — видео
+# ---------------------------------------------------------------------------
+
+# model -> (версия, тир, поддержка text-to-video, поддержка нативного аудио)
+KLING_MODELS = {
+    "2.6 pro": ("v2.6", "pro", False, True),
+    "2.1 master": ("v2.1", "master", True, False),
+    "2.1 pro": ("v2.1", "pro", True, False),
+    "2.1 standard": ("v2.1", "standard", True, False),
+}
+
+
+class KlingVideo:
+    """Kling (Kuaishou) через fal. Без картинки — text-to-video (2.1),
+    с подключённой image — image-to-video (+end-кадр). Kling 2.6 Pro —
+    только image-to-video, зато с нативным аудио."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "model": (list(KLING_MODELS), {"default": "2.6 pro"}),
+                "duration": (["5", "10"], {"default": "5"}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "end_image": ("IMAGE",),
+                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
+                "generate_audio": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Нативное аудио — только Kling 2.6 Pro (цена x2)"}),
+                "negative_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "blur, distort, and low quality"}),
+                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,
+                                        "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/Kling"
+
+    def generate(self, prompt, model, duration, image=None, end_image=None,
+                 aspect_ratio="16:9", generate_audio=False,
+                 negative_prompt="blur, distort, and low quality", cfg_scale=0.5):
+        _require_deps()
+        ver, tier, t2v_ok, audio_ok = KLING_MODELS[model]
+        args = {"prompt": prompt, "duration": duration, "cfg_scale": cfg_scale}
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            if end_image is not None:
+                args["tail_image_url"] = _upload_image_input(end_image, 1)[0]
+            if audio_ok and generate_audio:
+                args["generate_audio"] = True
+            endpoint = f"fal-ai/kling-video/{ver}/{tier}/image-to-video"
+        else:
+            if not t2v_ok:
+                raise RuntimeError(
+                    f"Kling {model} работает только в image-to-video — подключи "
+                    f"image. Для text-to-video выбери 2.1 master/pro/standard.")
+            args["aspect_ratio"] = aspect_ratio
+            endpoint = f"fal-ai/kling-video/{ver}/{tier}/text-to-video"
+
+        secs = int(duration)
+        if ver == "v2.6":  # известный тариф
+            per = 0.14 if (audio_ok and generate_audio) else 0.07
+            cost = f"~${per * secs:.2f}"
+        else:
+            cost = "тариф см. на fal"
+        print(f"[fal {endpoint}] ориентировочная стоимость: {cost} ({secs} с)")
+        result = _run_request(endpoint, args, est_seconds=secs * 30 + 60)
+        video = (result or {}).get("video") or {}
+        if not video.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(video["url"], "kling")
+
+
+# ---------------------------------------------------------------------------
 # Topaz Video Upscale
 # ---------------------------------------------------------------------------
 
@@ -1993,6 +2077,7 @@ NODE_CLASS_MAPPINGS = {
     "GPTImage2TextToImage_fal": GPTImage2TextToImage,
     "GPTImage2Edit_fal": GPTImage2Edit,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
+    "KlingVideo_fal": KlingVideo,
     "NanoBananaEdit_fal": NanoBananaEdit,
     "QwenImageMax_fal": QwenImageMax,
     "SeedreamV5Pro_fal": SeedreamV5Pro,
@@ -2012,6 +2097,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
+    "KlingVideo_fal": "Kling Video (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",

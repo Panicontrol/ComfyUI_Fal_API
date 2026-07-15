@@ -109,6 +109,11 @@ const CALCS = {
       : v.image_size === "auto_2K";
     return `≈ ${fmt((big ? 0.135 : 0.0675) * (v.num_images || 1))}`;
   },
+  KlingVideo_fal: (v) => {
+    if (v.model !== "2.6 pro") return "";  // тариф 2.1 не фиксирован
+    const per = v.generate_audio ? 0.14 : 0.07;
+    return `≈ ${fmt(per * parseInt(v.duration || "5", 10))}`;
+  },
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);
