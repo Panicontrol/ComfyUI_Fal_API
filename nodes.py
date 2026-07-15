@@ -1933,23 +1933,28 @@ class FluxLoraImage:
 
 
 class QwenImageEditLora:
-    """Qwen-Image Edit с пользовательскими LoRA (до 3). Редактирование картинки
-    по инструкции — в отличие от закрытой Qwen Image Max, здесь свои LoRA."""
+    """Qwen-Image Edit Plus (2509) с пользовательскими LoRA (до 3). Принимает
+    несколько картинок (image + image_2 + image_3 + URL) — редактирование и
+    композиция по нескольким референсам. В отличие от закрытой Qwen Image Max,
+    здесь свои LoRA."""
 
     @classmethod
     def INPUT_TYPES(cls):
         opt = {
+            "image_2": ("IMAGE",),
+            "image_3": ("IMAGE",),
             "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
             "num_inference_steps": ("INT", {"default": 30, "min": 1, "max": 60}),
             "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0,
                                          "step": 0.1}),
-            "acceleration": (["none", "regular", "high"], {"default": "none"}),
+            "acceleration": (["none", "regular"], {"default": "none"}),
             "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
             "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
             "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
             "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
         }
         opt.update(_lora_slot_inputs(3))
+        opt["extra_image_urls"] = ("STRING", {"multiline": True, "default": ""})
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -1964,14 +1969,20 @@ class QwenImageEditLora:
     FUNCTION = "generate"
     CATEGORY = "fal/LoRA"
 
-    def generate(self, image, prompt, image_size, negative_prompt="",
-                 num_inference_steps=30, guidance_scale=4.0, acceleration="none",
-                 num_images=1, custom_width=0, custom_height=0, seed=-1, **kw):
+    def generate(self, image, prompt, image_size, image_2=None, image_3=None,
+                 negative_prompt="", num_inference_steps=30, guidance_scale=4.0,
+                 acceleration="none", num_images=1, custom_width=0,
+                 custom_height=0, seed=-1, extra_image_urls="", **kw):
         _require_deps()
         loras = _build_loras(kw, 3)
+        urls = []
+        for img in (image, image_2, image_3):
+            if img is not None and len(urls) < 10:
+                urls += _upload_image_input(img, 10 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 10 - len(urls))
         args = {
             "prompt": prompt,
-            "image_url": _upload_image_input(image, 1)[0],
+            "image_urls": urls,
             "image_size": _img_size(image_size, custom_width, custom_height),
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
@@ -1984,13 +1995,14 @@ class QwenImageEditLora:
         if loras:
             args["loras"] = loras
         _seed_arg(args, seed)
-        print(f"[fal fal-ai/qwen-image-edit-lora] LoRA: {len(loras)} шт")
-        result = _run_request("fal-ai/qwen-image-edit-lora", args,
+        print(f"[fal fal-ai/qwen-image-edit-plus-lora] картинок: {len(urls)}, "
+              f"LoRA: {len(loras)} шт")
+        result = _run_request("fal-ai/qwen-image-edit-plus-lora", args,
                               est_seconds=20 * num_images)
-        urls = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
-        if not urls:
+        out = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
+        if not out:
             raise RuntimeError(f"fal не вернул изображения: {result}")
-        return _download_images_as_tensor(urls), "\n".join(urls)
+        return _download_images_as_tensor(out), "\n".join(out)
 
 
 class WanLoraVideo:
