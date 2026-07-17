@@ -590,12 +590,27 @@ def _download(url, prefix):
         if not os.path.exists(path):
             break
         idx += 1
-    resp = requests.get(url, stream=True, timeout=600)
-    resp.raise_for_status()
-    with open(path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1 << 20):
-            f.write(chunk)
-    return path
+    import time
+    last = None
+    for i in range(5):
+        try:
+            resp = requests.get(url, stream=True, timeout=(15, 300))
+            resp.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+            return path
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last = e
+            wait = min(20, 3 * (i + 1))
+            print(f"[fal] сбой загрузки видео ({type(e).__name__}), "
+                  f"повтор {i + 1}/5 через {wait} с")
+            time.sleep(wait)
+    raise RuntimeError(
+        f"Видео сгенерировано, но не скачалось с CDN fal ({type(last).__name__}). "
+        f"Ссылка (выход video_url): {url}")
 
 
 def _finish(url, prefix):
@@ -860,14 +875,42 @@ def _mask_to_url(mask):
     return _upload_pil(Image.fromarray(rgba, mode="RGBA"))
 
 
+def _download_bytes(url, attempts=5):
+    """Скачивает URL с повтором на таймаутах/обрывах CDN fal."""
+    import time
+    last = None
+    for i in range(attempts):
+        try:
+            resp = requests.get(url, timeout=(15, 120), stream=True)
+            resp.raise_for_status()
+            return resp.content
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last = e
+            wait = min(20, 3 * (i + 1))
+            print(f"[fal] сбой загрузки результата ({type(e).__name__}), "
+                  f"повтор {i + 1}/{attempts} через {wait} с")
+            time.sleep(wait)
+    raise last
+
+
 def _download_images_as_tensor(urls):
-    """Скачивает картинки и собирает IMAGE-батч ComfyUI."""
+    """Скачивает картинки и собирает IMAGE-батч ComfyUI. Если CDN fal не
+    отдаёт файл после повторов — ошибка со ссылками, чтобы забрать вручную
+    (результат уже сгенерирован и оплачен)."""
     import torch
     pils = []
     for u in urls:
-        resp = requests.get(u, timeout=300)
-        resp.raise_for_status()
-        pils.append(Image.open(io.BytesIO(resp.content)).convert("RGB"))
+        try:
+            data = _download_bytes(u)
+        except Exception as e:
+            raise RuntimeError(
+                "Результат сгенерирован, но не скачался с CDN fal "
+                f"({type(e).__name__}). Файлы доступны по ссылкам (выход "
+                f"image_urls / открой в браузере):\n  " + "\n  ".join(urls)
+            ) from e
+        pils.append(Image.open(io.BytesIO(data)).convert("RGB"))
     base = pils[0].size
     arrs = []
     for p in pils:
