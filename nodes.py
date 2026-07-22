@@ -2123,6 +2123,217 @@ def _run_wan(endpoint, args):
     return video["url"]
 
 
+# ---------------------------------------------------------------------------
+# Сегментация: SAM 2 (image/video) и EVF-SAM (по тексту)
+# ---------------------------------------------------------------------------
+
+def _parse_points(text):
+    """Строки 'x,y[,label[,frame]]' -> список PointPrompt (label 1=объект,0=фон)."""
+    pts = []
+    for line in (text or "").splitlines():
+        line = line.strip().replace(";", ",")
+        if not line:
+            continue
+        p = [s for s in (x.strip() for x in line.split(",")) if s != ""]
+        if len(p) < 2:
+            continue
+        pts.append({
+            "x": int(float(p[0])), "y": int(float(p[1])),
+            "label": int(float(p[2])) if len(p) >= 3 else 1,
+            "frame_index": int(float(p[3])) if len(p) >= 4 else 0,
+        })
+    return pts
+
+
+def _parse_boxes(text):
+    """Строки 'x_min,y_min,x_max,y_max[,frame]' -> список BoxPrompt."""
+    boxes = []
+    for line in (text or "").splitlines():
+        line = line.strip().replace(";", ",")
+        if not line:
+            continue
+        p = [s for s in (x.strip() for x in line.split(",")) if s != ""]
+        if len(p) < 4:
+            continue
+        boxes.append({
+            "x_min": int(float(p[0])), "y_min": int(float(p[1])),
+            "x_max": int(float(p[2])), "y_max": int(float(p[3])),
+            "frame_index": int(float(p[4])) if len(p) >= 5 else 0,
+        })
+    return boxes
+
+
+def _single_url(result):
+    for key in ("image", "mask", "file"):
+        v = (result or {}).get(key)
+        if isinstance(v, dict) and v.get("url"):
+            return v["url"]
+    imgs = (result or {}).get("images")
+    if imgs and isinstance(imgs, list) and imgs[0].get("url"):
+        return imgs[0]["url"]
+    return None
+
+
+def _download_mask_and_image(url):
+    """Скачанный PNG -> (IMAGE (1,H,W,3), MASK (1,H,W))."""
+    import torch
+    data = _download_bytes(url)
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    rgb = np.asarray(img).astype(np.float32) / 255.0
+    mask = np.asarray(img.convert("L")).astype(np.float32) / 255.0
+    return torch.from_numpy(rgb)[None, ...], torch.from_numpy(mask)[None, ...]
+
+
+class SAM2Image:
+    """SAM 2 — сегментация картинки по точкам/боксам. Точки: строки 'x,y,label'
+    (label 1=объект, 0=фон); боксы: 'x_min,y_min,x_max,y_max'. Координаты — в
+    пикселях входной картинки. Выход: визуализация (IMAGE) и маска (MASK)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"image": ("IMAGE",)},
+            "optional": {
+                "points": ("STRING", {"multiline": True, "default": "",
+                                      "tooltip": "по строке: x,y  или  x,y,label"}),
+                "boxes": ("STRING", {"multiline": True, "default": "",
+                                     "tooltip": "по строке: x_min,y_min,x_max,y_max"}),
+                "apply_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "True — наложить маску на картинку; "
+                               "False — вернуть саму маску (для выхода MASK)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "segment"
+    CATEGORY = "fal/Segment"
+
+    def segment(self, image, points="", boxes="", apply_mask=False):
+        _require_deps()
+        pts, bxs = _parse_points(points), _parse_boxes(boxes)
+        if not pts and not bxs:
+            raise RuntimeError(
+                "SAM 2 нужна хотя бы одна подсказка: добавь точку 'x,y' в points "
+                "или бокс в boxes (координаты в пикселях картинки).")
+        args = {"image_url": _upload_image_input(image, 1)[0],
+                "apply_mask": apply_mask, "output_format": "png"}
+        if pts:
+            args["prompts"] = pts
+        if bxs:
+            args["box_prompts"] = bxs
+        print(f"[fal fal-ai/sam2/image] точек: {len(pts)}, боксов: {len(bxs)}")
+        result = _run_request("fal-ai/sam2/image", args, est_seconds=20)
+        url = _single_url(result)
+        if not url:
+            raise RuntimeError(f"fal не вернул результат: {result}")
+        return _download_mask_and_image(url)
+
+
+class SAM2Video:
+    """SAM 2 — сегментация и трекинг объекта в видео. Укажи точку/бокс на кадре
+    (frame_index, по умолчанию 0), модель протянет маску через всё видео."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"video": ("VIDEO",)},
+            "optional": {
+                "points": ("STRING", {"multiline": True, "default": "",
+                                      "tooltip": "x,y,label,frame — по строке"}),
+                "boxes": ("STRING", {"multiline": True, "default": "",
+                                     "tooltip": "x_min,y_min,x_max,y_max,frame"}),
+                "apply_mask": ("BOOLEAN", {"default": True,
+                                           "tooltip": "наложить маску на видео"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "segment"
+    CATEGORY = "fal/Segment"
+
+    def segment(self, video, points="", boxes="", apply_mask=True):
+        _require_deps()
+        pts, bxs = _parse_points(points), _parse_boxes(boxes)
+        if not pts and not bxs:
+            raise RuntimeError(
+                "SAM 2 video нужна подсказка: точка 'x,y' или бокс на кадре "
+                "(frame_index, по умолчанию 0).")
+        url, _, _, _ = _upload_video_input(video, label="видео для сегментации",
+                                           min_duration=None)
+        args = {"video_url": url, "apply_mask": apply_mask}
+        if pts:
+            args["prompts"] = pts
+        if bxs:
+            args["box_prompts"] = bxs
+        print(f"[fal fal-ai/sam2/video] точек: {len(pts)}, боксов: {len(bxs)}")
+        result = _run_request("fal-ai/sam2/video", args, est_seconds=180)
+        video_out = (result or {}).get("video") or {}
+        if not video_out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(video_out["url"], "sam2")
+
+
+class EVFSAM:
+    """EVF-SAM — сегментация по текстовому описанию. Напиши, что выделить
+    ('hair', 'lips', 'the person', 'красная машина'). Возвращает бинарную маску.
+    semantic_type=True — для частей тела/лица."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "semantic_type": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "семантический режим — для частей тела/лица"}),
+                "revert_mask": ("BOOLEAN", {"default": False,
+                                            "tooltip": "инвертировать маску"}),
+                "fill_holes": ("BOOLEAN", {"default": False}),
+                "expand_mask": ("INT", {"default": 0, "min": 0, "max": 128,
+                                        "tooltip": "расширить маску на N пикселей"}),
+                "blur_mask": ("INT", {"default": 0, "min": 0, "max": 99, "step": 2,
+                                      "tooltip": "размытие краёв (нечётное ядро)"}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("mask", "image")
+    FUNCTION = "segment"
+    CATEGORY = "fal/Segment"
+
+    def segment(self, image, prompt, negative_prompt="", semantic_type=False,
+                revert_mask=False, fill_holes=False, expand_mask=0, blur_mask=0):
+        _require_deps()
+        args = {
+            "image_url": _upload_image_input(image, 1)[0],
+            "prompt": prompt,
+            "mask_only": True,
+            "semantic_type": semantic_type,
+            "revert_mask": revert_mask,
+            "fill_holes": fill_holes,
+        }
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+        if expand_mask > 0:
+            args["expand_mask"] = expand_mask
+        if blur_mask > 0:
+            args["blur_mask"] = blur_mask if blur_mask % 2 == 1 else blur_mask + 1
+        print(f"[fal fal-ai/evf-sam] сегментация по тексту: «{prompt[:40]}»")
+        result = _run_request("fal-ai/evf-sam", args, est_seconds=20)
+        url = _single_url(result)
+        if not url:
+            raise RuntimeError(f"fal не вернул результат: {result}")
+        img, mask = _download_mask_and_image(url)
+        return mask, img
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -2133,6 +2344,9 @@ NODE_CLASS_MAPPINGS = {
     "GPTImage2Edit_fal": GPTImage2Edit,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "KlingVideo_fal": KlingVideo,
+    "SAM2Image_fal": SAM2Image,
+    "SAM2Video_fal": SAM2Video,
+    "EVFSAM_fal": EVFSAM,
     "NanoBananaEdit_fal": NanoBananaEdit,
     "QwenImageMax_fal": QwenImageMax,
     "SeedreamV5Pro_fal": SeedreamV5Pro,
@@ -2153,6 +2367,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "KlingVideo_fal": "Kling Video (fal)",
+    "SAM2Image_fal": "SAM 2 Image Segment (fal)",
+    "SAM2Video_fal": "SAM 2 Video Segment (fal)",
+    "EVFSAM_fal": "EVF-SAM Text Segment (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
