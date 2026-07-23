@@ -2048,6 +2048,142 @@ class Flux2LoraImage:
         return _download_images_as_tensor(out), "\n".join(out)
 
 
+class FluxLoraTrainer:
+    """Обучение FLUX LoRA на fal из IMAGE-батча. fast — универсальный,
+    portrait — под лица/людей. Кадры сохраняются в PNG, при наличии — капшны
+    (по строке на кадр), зипуются и грузятся в fal. Готовая LoRA скачивается
+    в models/loras и сразу пригодна для ноды FLUX.1 LoRA.
+    ВНИМАНИЕ: обучение платное и идёт несколько минут."""
+
+    _TRAINERS = {
+        "fast": "fal-ai/flux-lora-fast-training",
+        "portrait": "fal-ai/flux-lora-portrait-trainer",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "trigger": ("STRING", {"default": "",
+                                       "tooltip": "слово-активатор (имя персонажа/стиля)"}),
+                "trainer": (list(cls._TRAINERS), {"default": "fast"}),
+                "steps": ("INT", {"default": 1000, "min": 100, "max": 6000,
+                                  "tooltip": "fast ~1000, portrait ~2500"}),
+            },
+            "optional": {
+                "captions": ("STRING", {"multiline": True, "default": "",
+                                        "tooltip": "по строке на кадр; пусто = "
+                                                   "авто-капшн (или только trigger)"}),
+                "is_style": ("BOOLEAN", {"default": False,
+                                         "tooltip": "fast: обучение стиля, "
+                                                    "без масок/авто-капшнов"}),
+                "create_masks": ("BOOLEAN", {"default": True,
+                                             "tooltip": "сегментация субъекта"}),
+                "learning_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.01,
+                                            "step": 0.00001,
+                                            "tooltip": "0 = дефолт тренера"}),
+                "output_name": ("STRING", {"default": "",
+                                           "tooltip": "имя .safetensors; пусто = авто"}),
+                "auto_download": ("BOOLEAN", {"default": True,
+                                              "tooltip": "скачать LoRA в models/loras"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("lora_path", "lora_url", "config_url")
+    FUNCTION = "train"
+    CATEGORY = "fal/Train"
+    OUTPUT_NODE = True
+
+    def train(self, images, trigger, trainer, steps, captions="",
+              is_style=False, create_masks=True, learning_rate=0.0,
+              output_name="", auto_download=True):
+        _require_deps()
+        import zipfile
+        pils = _tensor_batch_to_pil(images)
+        n = len(pils)
+        min_n = 10 if trainer == "portrait" else 4
+        if n < min_n:
+            print(f"[fal train] предупреждение: {n} кадров — тренер '{trainer}' "
+                  f"рекомендует минимум {min_n}. Качество может пострадать.")
+        cap_lines = [c.strip() for c in (captions or "").splitlines()]
+
+        tmpdir = tempfile.mkdtemp(prefix="flux_train_")
+        zip_path = os.path.join(tempfile.gettempdir(),
+                                f"flux_train_{os.getpid()}.zip")
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                for i, img in enumerate(pils):
+                    name = f"img_{i:03d}"
+                    p = os.path.join(tmpdir, name + ".png")
+                    img.save(p, "PNG")
+                    z.write(p, name + ".png")
+                    if i < len(cap_lines) and cap_lines[i]:
+                        cp = os.path.join(tmpdir, name + ".txt")
+                        with open(cp, "w", encoding="utf-8") as f:
+                            f.write(cap_lines[i])
+                        z.write(cp, name + ".txt")
+            print(f"[fal train] загружаю датасет: {n} кадров, "
+                  f"капшнов: {sum(1 for c in cap_lines[:n] if c)}")
+            data_url = fal_client.upload_file(zip_path)
+        finally:
+            for f in os.listdir(tmpdir):
+                try:
+                    os.unlink(os.path.join(tmpdir, f))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+            try:
+                os.unlink(zip_path)
+            except OSError:
+                pass
+
+        endpoint = self._TRAINERS[trainer]
+        args = {"images_data_url": data_url, "steps": steps}
+        if trainer == "portrait":
+            if trigger.strip():
+                args["trigger_phrase"] = trigger.strip()
+            if learning_rate > 0:
+                args["learning_rate"] = learning_rate
+            if create_masks:
+                args["create_masks"] = True
+        else:  # fast
+            if trigger.strip():
+                args["trigger_word"] = trigger.strip()
+            args["is_style"] = is_style
+            if not is_style:
+                args["create_masks"] = create_masks
+            if learning_rate > 0:
+                args["learning_rate"] = learning_rate
+
+        print(f"[fal {endpoint}] старт обучения: {steps} шагов "
+              f"(это займёт несколько минут, задача платная)")
+        result = _run_request(endpoint, args, est_seconds=steps * 0.6 + 180)
+        lora = (result or {}).get("diffusers_lora_file") or {}
+        lora_url = lora.get("url")
+        cfg_url = ((result or {}).get("config_file") or {}).get("url", "")
+        if not lora_url:
+            raise RuntimeError(f"fal не вернул LoRA: {result}")
+
+        local_path = ""
+        if auto_download:
+            base = output_name.strip() or (trigger.strip() or "flux") + f"_{trainer}"
+            if not base.endswith(".safetensors"):
+                base += ".safetensors"
+            loras_dir = LoraConvert._loras_dir()
+            local_path = os.path.join(loras_dir, base)
+            data = _download_bytes(lora_url)
+            with open(local_path, "wb") as f:
+                f.write(data)
+            print(f"[fal train] LoRA сохранена: {local_path} "
+                  f"({len(data)/1e6:.0f} МБ)")
+        return (local_path, lora_url, cfg_url)
+
+
 class QwenImageEditLora:
     """Qwen-Image Edit Plus (2509) с пользовательскими LoRA (до 3). Принимает
     несколько картинок (image + image_2 + image_3 + URL) — редактирование и
@@ -2426,6 +2562,7 @@ NODE_CLASS_MAPPINGS = {
     "IdeogramImage_fal": IdeogramImage,
     "FluxLoraImage_fal": FluxLoraImage,
     "Flux2LoraImage_fal": Flux2LoraImage,
+    "FluxLoraTrainer_fal": FluxLoraTrainer,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
     "LoraConvert_fal": LoraConvert,
@@ -2450,6 +2587,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IdeogramImage_fal": "Ideogram V4 / V3 Edit (fal)",
     "FluxLoraImage_fal": "FLUX.1 LoRA (fal)",
     "Flux2LoraImage_fal": "FLUX.2 LoRA (fal)",
+    "FluxLoraTrainer_fal": "FLUX LoRA Trainer (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
     "LoraConvert_fal": "LoRA Convert fp16 / уменьшить ранг",
