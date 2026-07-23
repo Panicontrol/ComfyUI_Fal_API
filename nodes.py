@@ -328,6 +328,8 @@ def _resolve_media_list(text, limit):
     ни на URL (например «0» от сдвига виджетов старой ноды), пропускаются
     с предупреждением."""
     urls = []
+    if limit is not None and limit <= 0:
+        return urls
     for line in (str(text) if text is not None else "").splitlines():
         line = line.strip()
         if not line:
@@ -1975,6 +1977,77 @@ class FluxLoraImage:
         return _download_images_as_tensor(urls), "\n".join(urls)
 
 
+class Flux2LoraImage:
+    """FLUX.2 [dev] с пользовательскими LoRA. Без картинок — text-to-image;
+    с подключёнными image_1..image_3 — edit (до 3 референсов).
+    ВНИМАНИЕ: LoRA для FLUX.2 не совместимы с FLUX.1 — нужны обученные под FLUX.2."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "image_1": ("IMAGE",),
+            "image_2": ("IMAGE",),
+            "image_3": ("IMAGE",),
+            "num_inference_steps": ("INT", {"default": 28, "min": 1, "max": 60}),
+            "guidance_scale": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 20.0,
+                                         "step": 0.1}),
+            "acceleration": (["none", "regular", "high"], {"default": "regular"}),
+            "custom_width": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "custom_height": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        opt["extra_image_urls"] = ("STRING", {"multiline": True, "default": ""})
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (IMG_SIZES, {"default": "landscape_16_9"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/LoRA"
+
+    def generate(self, prompt, image_size, num_images, image_1=None, image_2=None,
+                 image_3=None, num_inference_steps=28, guidance_scale=2.5,
+                 acceleration="regular", custom_width=0, custom_height=0,
+                 seed=-1, extra_image_urls="", **kw):
+        _require_deps()
+        loras = _build_loras(kw, 3)
+        urls = []
+        for img in (image_1, image_2, image_3):
+            if img is not None and len(urls) < 3:
+                urls += _upload_image_input(img, 3 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 3 - len(urls))
+        args = {
+            "prompt": prompt,
+            "image_size": _img_size(image_size, custom_width, custom_height),
+            "num_images": num_images,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "acceleration": acceleration,
+            "output_format": "png",
+        }
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+        if urls:
+            args["image_urls"] = urls
+            endpoint = "fal-ai/flux-2/lora/edit"
+        else:
+            endpoint = "fal-ai/flux-2/lora"
+        print(f"[fal {endpoint}] картинок: {len(urls)}, LoRA: {len(loras)} шт")
+        result = _run_request(endpoint, args, est_seconds=15 * num_images)
+        out = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
+        if not out:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        return _download_images_as_tensor(out), "\n".join(out)
+
+
 class QwenImageEditLora:
     """Qwen-Image Edit Plus (2509) с пользовательскими LoRA (до 3). Принимает
     несколько картинок (image + image_2 + image_3 + URL) — редактирование и
@@ -2352,6 +2425,7 @@ NODE_CLASS_MAPPINGS = {
     "SeedreamV5Pro_fal": SeedreamV5Pro,
     "IdeogramImage_fal": IdeogramImage,
     "FluxLoraImage_fal": FluxLoraImage,
+    "Flux2LoraImage_fal": Flux2LoraImage,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
     "LoraConvert_fal": LoraConvert,
@@ -2374,7 +2448,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
     "IdeogramImage_fal": "Ideogram V4 / V3 Edit (fal)",
-    "FluxLoraImage_fal": "FLUX LoRA (fal)",
+    "FluxLoraImage_fal": "FLUX.1 LoRA (fal)",
+    "Flux2LoraImage_fal": "FLUX.2 LoRA (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
     "LoraConvert_fal": "LoRA Convert fp16 / уменьшить ранг",
