@@ -109,6 +109,17 @@ const CALCS = {
       : v.image_size === "auto_2K";
     return `≈ ${fmt((big ? 0.135 : 0.0675) * (v.num_images || 1))}`;
   },
+  Flux2LoraImage_fal: (v) => {
+    const presetPx = {
+      square_hd: 1024 * 1024, square: 512 * 512,
+      landscape_4_3: 1024 * 768, portrait_4_3: 768 * 1024,
+      landscape_16_9: 1024 * 576, portrait_16_9: 576 * 1024,
+    };
+    const px = (v.custom_width > 0 && v.custom_height > 0)
+      ? v.custom_width * v.custom_height
+      : (presetPx[v.image_size] ?? 1024 * 1024);
+    return `≈ ${fmt(0.021 * (px / 1e6) * (v.num_images || 1))}`;
+  },
   KlingVideo_fal: (v) => {
     if (v.model !== "2.6 pro") return "";  // тариф 2.1 не фиксирован
     const per = v.generate_audio ? 0.14 : 0.07;

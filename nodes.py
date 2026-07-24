@@ -1774,9 +1774,23 @@ def _build_loras(kw, n=3, extra=None):
 IMG_SIZES = ["landscape_16_9", "landscape_4_3", "square_hd", "square",
              "portrait_4_3", "portrait_16_9"]
 
+# пиксели пресетов fal (для оценки стоимости по мегапикселям)
+_PRESET_PX = {
+    "square_hd": 1024 * 1024, "square": 512 * 512,
+    "landscape_4_3": 1024 * 768, "portrait_4_3": 768 * 1024,
+    "landscape_16_9": 1024 * 576, "portrait_16_9": 576 * 1024,
+}
+_FLUX2_RATE_MP = 0.021  # $ за мегапиксель выхода
+
 
 def _img_size(preset, cw, ch):
     return {"width": cw, "height": ch} if cw > 0 and ch > 0 else preset
+
+
+def _preset_px(preset, cw, ch):
+    if cw > 0 and ch > 0:
+        return cw * ch
+    return _PRESET_PX.get(preset, 1024 * 1024)
 
 
 class LoraConvert:
@@ -2040,7 +2054,10 @@ class Flux2LoraImage:
             endpoint = "fal-ai/flux-2/lora/edit"
         else:
             endpoint = "fal-ai/flux-2/lora"
-        print(f"[fal {endpoint}] картинок: {len(urls)}, LoRA: {len(loras)} шт")
+        mp = _preset_px(image_size, custom_width, custom_height) / 1e6
+        cost = _FLUX2_RATE_MP * mp * num_images
+        print(f"[fal {endpoint}] картинок: {len(urls)}, LoRA: {len(loras)} шт, "
+              f"ориентировочная стоимость: ~${cost:.3f} ({mp:.2f} МП x{num_images})")
         result = _run_request(endpoint, args, est_seconds=15 * num_images)
         out = [i["url"] for i in (result or {}).get("images", []) if i.get("url")]
         if not out:
