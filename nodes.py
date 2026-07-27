@@ -2560,6 +2560,313 @@ class EVFSAM:
         return mask, img
 
 
+# ---------------------------------------------------------------------------
+# LTX-2.3 (Lightricks): text/image/reference-to-video + LoRA, extend, reframe
+# ---------------------------------------------------------------------------
+
+_LTX_SIZES = ["auto", "landscape_16_9", "landscape_4_3", "square_hd", "square",
+              "portrait_4_3", "portrait_16_9"]
+
+# Стандартные пресеты ImageSize у fal (для видео обычно задают custom_width/height)
+_LTX_WH = {
+    "landscape_16_9": (1024, 576), "landscape_4_3": (1024, 768),
+    "square_hd": (1024, 1024), "square": (512, 512),
+    "portrait_4_3": (768, 1024), "portrait_16_9": (576, 1024),
+}
+
+_LTX_CAMERA = ["none", "dolly_in", "dolly_out", "dolly_left", "dolly_right",
+               "jib_up", "jib_down", "static"]
+
+# $ за мегапиксель сгенерированного видео (ширина x высота x кадры)
+_LTX_RATE_MP = {"quality": 0.001605, "distilled": 0.001205}
+_LTX_MODELS = ["22B quality", "22B distilled (быстрее и дешевле)"]
+
+
+def _ltx_frames(n):
+    """LTX работает с кадрами вида 8k+1 — подгоняем ближайшее допустимое."""
+    n = max(9, int(n))
+    return int(round((n - 1) / 8.0)) * 8 + 1
+
+
+def _ltx_dims(video_size, cw, ch, image=None):
+    """Разрешение, из которого считается цена (и что уйдёт в video_size)."""
+    if cw > 0 and ch > 0:
+        return int(cw), int(ch)
+    if video_size == "auto":
+        if image is not None:
+            try:
+                return int(image.shape[2]), int(image.shape[1])  # (B,H,W,C)
+            except Exception:
+                pass
+        return 1280, 720  # оценка: реальный размер выберет модель
+    return _LTX_WH.get(video_size, (1024, 576))
+
+
+def _ltx_cost(w, h, frames, distilled):
+    rate = _LTX_RATE_MP["distilled" if distilled else "quality"]
+    return rate * (w * h * frames) / 1e6
+
+
+class LTX23Video:
+    """LTX-2.3 22B — видео со звуком и пользовательскими LoRA.
+
+    Режим выбирается по подключённым входам: ничего — text-to-video,
+    image — image-to-video (первый кадр), video — reference-to-video.
+    LoRA-слоты работают во всех режимах (эндпоинт /lora подставляется сам).
+    Цена: $0.001605 (quality) / $0.001205 (distilled) за мегапиксель
+    ширина x высота x кадры."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "image": ("IMAGE", {"tooltip": "первый кадр -> image-to-video"}),
+            "end_image": ("IMAGE", {"tooltip": "последний кадр (необязательно)"}),
+            "video": ("VIDEO", {"tooltip": "видео-референс -> reference-to-video"}),
+            "audio": ("AUDIO", {"tooltip": "своя звуковая дорожка (для режима с видео)"}),
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            "custom_width": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 8,
+                                     "tooltip": "0 — брать пресет video_size"}),
+            "custom_height": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 8}),
+            "num_inference_steps": ("INT", {
+                "default": 0, "min": 0, "max": 60,
+                "tooltip": "0 — по умолчанию модели (40 у quality)"}),
+            "video_cfg_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0,
+                                          "step": 0.1, "tooltip": "0 — по умолчанию"}),
+            "image_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                                         "step": 0.05}),
+            "video_strength": ("FLOAT", {
+                "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                "tooltip": "сила привязки к видео-референсу; меньше — больше свободы"}),
+            "camera_lora": (_LTX_CAMERA, {"default": "none",
+                                          "tooltip": "встроенная LoRA движения камеры"}),
+            "camera_lora_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0,
+                                            "step": 0.05}),
+            "acceleration": (["default", "none", "regular", "high", "full"],
+                             {"default": "default"}),
+            "scheduler": (["default", "ltx2", "linear_quadratic", "beta"],
+                          {"default": "default"}),
+            "video_quality": (["high", "maximum", "medium", "low"], {"default": "high"}),
+            "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
+            "enable_safety_checker": ("BOOLEAN", {"default": True}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "model": (_LTX_MODELS, {"default": _LTX_MODELS[0]}),
+                "num_frames": ("INT", {
+                    "default": 121, "min": 9, "max": 481, "step": 8,
+                    "tooltip": "121 кадр @24 fps = ~5 с. Округляется до 8k+1"}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60}),
+                "video_size": (_LTX_SIZES, {"default": "auto"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/LTX"
+
+    def generate(self, prompt, model, num_frames=121, fps=24, video_size="auto",
+                 generate_audio=True, seed=-1, image=None, end_image=None,
+                 video=None, audio=None, negative_prompt="",
+                 custom_width=0, custom_height=0, num_inference_steps=0,
+                 video_cfg_scale=0.0, image_strength=1.0, video_strength=1.0,
+                 camera_lora="none", camera_lora_scale=1.0,
+                 acceleration="default", scheduler="default",
+                 video_quality="high", enable_prompt_expansion=True,
+                 enable_safety_checker=True, **kw):
+        _require_deps()
+        distilled = "distilled" in model
+        loras = _build_loras(kw, 3)
+        frames = _ltx_frames(num_frames)
+
+        args = {
+            "prompt": prompt,
+            "num_frames": frames,
+            "fps": float(fps),
+            "generate_audio": bool(generate_audio),
+            "video_quality": video_quality,
+            "enable_prompt_expansion": bool(enable_prompt_expansion),
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        if custom_width > 0 and custom_height > 0:
+            args["video_size"] = {"width": int(custom_width), "height": int(custom_height)}
+        elif video_size != "auto":
+            args["video_size"] = video_size
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+        if num_inference_steps > 0:
+            args["num_inference_steps"] = int(num_inference_steps)
+        if video_cfg_scale > 0:
+            args["video_cfg_scale"] = float(video_cfg_scale)
+        if acceleration != "default":
+            args["acceleration"] = acceleration
+        if scheduler != "default":
+            args["scheduler"] = scheduler
+        if camera_lora != "none":
+            args["camera_lora"] = camera_lora
+            args["camera_lora_scale"] = float(camera_lora_scale)
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+
+        base = "fal-ai/ltx-2.3-22b" + ("/distilled" if distilled else "")
+        if video is not None:
+            args["video_url"] = _upload_video_input(video, "видео-референс",
+                                                    min_duration=0.0)[0]
+            args["video_strength"] = float(video_strength)
+            task = "/reference-video-to-video"
+            if audio is not None:
+                args["audio_url"] = _upload_audio_input(audio)
+            if image is not None:
+                args["image_url"] = _upload_image_input(image, 1)[0]
+        elif image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            args["image_strength"] = float(image_strength)
+            task = "/image-to-video"
+        else:
+            task = "/text-to-video"
+        if end_image is not None:
+            args["end_image_url"] = _upload_image_input(end_image, 1)[0]
+        endpoint = base + task + ("/lora" if loras else "")
+
+        w, h = _ltx_dims(video_size, custom_width, custom_height, image)
+        secs = frames / max(fps, 1)
+        print(f"[fal {endpoint}] {w}x{h}, {frames} кадров (~{secs:.1f} с), "
+              f"LoRA: {len(loras)} шт, ориентировочная стоимость "
+              f"~${_ltx_cost(w, h, frames, distilled):.2f}")
+        result = _run_request(endpoint, args, est_seconds=secs * 25 + 40)
+        url = ((result or {}).get("video") or {}).get("url")
+        if not url:
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(url, "ltx23")
+
+
+class LTX23ExtendVideo:
+    """LTX-2.3 Extend — продолжает существующее видео вперёд или назад,
+    с поддержкой LoRA. Берёт последние (или первые) num_context_frames кадров
+    как контекст и дорисовывает num_frames кадров."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            "extend_direction": (["forward", "backward"], {
+                "default": "forward",
+                "tooltip": "forward — продолжить с конца, backward — дорисовать начало"}),
+            "num_context_frames": ("INT", {
+                "default": 25, "min": 1, "max": 121,
+                "tooltip": "сколько кадров исходника взять как контекст"}),
+            "frames_per_second": ("INT", {"default": 24, "min": 8, "max": 60}),
+            "num_inference_steps": ("INT", {"default": 0, "min": 0, "max": 60,
+                                            "tooltip": "0 — по умолчанию (15)"}),
+            "guidance_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0,
+                                         "step": 0.1, "tooltip": "0 — по умолчанию (1)"}),
+            "video_quality": (["high", "maximum", "medium", "low"], {"default": "high"}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+        }
+        opt.update(_lora_slot_inputs(3))
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "num_frames": ("INT", {
+                    "default": 121, "min": 9, "max": 481, "step": 8,
+                    "tooltip": "сколько кадров сгенерировать (с учётом контекста)"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "extend"
+    CATEGORY = "fal/LTX"
+
+    def extend(self, video, prompt, num_frames=121, generate_audio=True,
+               negative_prompt="", extend_direction="forward",
+               num_context_frames=25, frames_per_second=24,
+               num_inference_steps=0, guidance_scale=0.0,
+               video_quality="high", seed=-1, **kw):
+        _require_deps()
+        loras = _build_loras(kw, 3)
+        frames = _ltx_frames(num_frames)
+        url_in, dur, w, h = _upload_video_input(video, "видео", min_duration=0.0)
+        args = {
+            "video_url": url_in,
+            "prompt": prompt,
+            "num_frames": frames,
+            "num_context_frames": int(num_context_frames),
+            "extend_direction": extend_direction,
+            "frames_per_second": int(frames_per_second),
+            "generate_audio": bool(generate_audio),
+            "video_quality": video_quality,
+        }
+        if negative_prompt.strip():
+            args["negative_prompt"] = negative_prompt
+        if num_inference_steps > 0:
+            args["num_inference_steps"] = int(num_inference_steps)
+        if guidance_scale > 0:
+            args["guidance_scale"] = float(guidance_scale)
+        if loras:
+            args["loras"] = loras
+        _seed_arg(args, seed)
+
+        endpoint = "fal-ai/ltx-2.3-quality/extend-video" + ("/lora" if loras else "")
+        secs = frames / max(frames_per_second, 1)
+        cost = _ltx_cost(w or 1280, h or 720, frames, False)
+        print(f"[fal {endpoint}] {extend_direction}, +{frames} кадров (~{secs:.1f} с), "
+              f"LoRA: {len(loras)} шт, ориентировочная стоимость ~${cost:.2f}")
+        result = _run_request(endpoint, args, est_seconds=secs * 25 + 40)
+        url = ((result or {}).get("video") or {}).get("url")
+        if not url:
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(url, "ltx23_extend")
+
+
+class LTX23Reframe:
+    """LTX-2.3 Reframe — меняет соотношение сторон видео, дорисовывая кадр
+    (вертикаль из горизонтали и наоборот). Максимум 60 секунд исходника."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "aspect_ratio": (["9:16", "16:9", "1:1", "4:5", "5:4"],
+                                 {"default": "9:16"}),
+                "resolution": (["1080p", "720p"], {"default": "1080p"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "reframe"
+    CATEGORY = "fal/LTX"
+
+    def reframe(self, video, aspect_ratio="9:16", resolution="1080p"):
+        _require_deps()
+        url_in, dur, w, h = _upload_video_input(video, "видео", min_duration=0.0)
+        if dur is not None and dur > 60:
+            raise RuntimeError(
+                f"Reframe принимает максимум 60 с, а на входе {dur:.1f} с — "
+                f"нарежь видео короче.")
+        args = {"video_url": url_in, "aspect_ratio": aspect_ratio,
+                "resolution": resolution}
+        print(f"[fal fal-ai/ltx-2.3/reframe] {aspect_ratio} @ {resolution}"
+              + (f", исходник {dur:.1f} с" if dur else ""))
+        result = _run_request("fal-ai/ltx-2.3/reframe", args,
+                              est_seconds=(dur or 5) * 20 + 40)
+        url = ((result or {}).get("video") or {}).get("url")
+        if not url:
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(url, "ltx23_reframe")
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -2583,6 +2890,9 @@ NODE_CLASS_MAPPINGS = {
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
     "LoraConvert_fal": LoraConvert,
+    "LTX23Video_fal": LTX23Video,
+    "LTX23ExtendVideo_fal": LTX23ExtendVideo,
+    "LTX23Reframe_fal": LTX23Reframe,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2608,4 +2918,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
     "LoraConvert_fal": "LoRA Convert fp16 / уменьшить ранг",
+    "LTX23Video_fal": "LTX-2.3 Video LoRA (fal)",
+    "LTX23ExtendVideo_fal": "LTX-2.3 Extend Video (fal)",
+    "LTX23Reframe_fal": "LTX-2.3 Reframe (fal)",
 }

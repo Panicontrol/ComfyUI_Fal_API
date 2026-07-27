@@ -125,6 +125,28 @@ const CALCS = {
     const per = v.generate_audio ? 0.14 : 0.07;
     return `≈ ${fmt(per * parseInt(v.duration || "5", 10))}`;
   },
+  LTX23Video_fal: (v) => {
+    const wh = {
+      landscape_16_9: [1024, 576], landscape_4_3: [1024, 768],
+      square_hd: [1024, 1024], square: [512, 512],
+      portrait_4_3: [768, 1024], portrait_16_9: [576, 1024],
+    };
+    let w, h;
+    if (v.custom_width > 0 && v.custom_height > 0) {
+      w = v.custom_width; h = v.custom_height;
+    } else if (v.video_size === "auto" || !wh[v.video_size]) {
+      w = 1280; h = 720;                       // реальный размер выберет модель
+    } else {
+      [w, h] = wh[v.video_size];
+    }
+    const frames = Math.round(((v.num_frames || 121) - 1) / 8) * 8 + 1;
+    const rate = String(v.model || "").includes("distilled") ? 0.001205 : 0.001605;
+    return `≈ ${fmt(rate * (w * h * frames) / 1e6)}`;
+  },
+  LTX23ExtendVideo_fal: (v) => {
+    const frames = Math.round(((v.num_frames || 121) - 1) / 8) * 8 + 1;
+    return `≈ ${fmt(0.001605 * (1280 * 720 * frames) / 1e6)}`;  // по 720p
+  },
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);

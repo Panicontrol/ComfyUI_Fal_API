@@ -11,6 +11,9 @@
 | Seedance 2.0 Reference-to-Video (fal) | `bytedance/seedance-2.0/reference-to-video` | До 9 картинок + до 3 видео + до 3 аудио как референсы |
 | Seedance 1.5 Pro Text-to-Video (fal) | `fal-ai/bytedance/seedance/v1.5/pro/text-to-video` | Дешевле, 4–12 сек |
 | Seedance 1.5 Pro Image-to-Video (fal) | `fal-ai/bytedance/seedance/v1.5/pro/image-to-video` | Дешевле, первый+последний кадр |
+| LTX-2.3 Video LoRA (fal) | `fal-ai/ltx-2.3-22b/{text,image,reference-video}-to-video[/lora]` (+`/distilled`) | Видео со звуком, 3 слота LoRA, LoRA камеры, режим по подключённым входам |
+| LTX-2.3 Extend Video (fal) | `fal-ai/ltx-2.3-quality/extend-video[/lora]` | Продолжает ролик вперёд или назад, с LoRA |
+| LTX-2.3 Reframe (fal) | `fal-ai/ltx-2.3/reframe` | Меняет соотношение сторон, дорисовывая кадр (до 60 с) |
 
 Каждая нода возвращает три выхода: `video` (нативный тип VIDEO — подключается к Save Video / Preview Video), `video_url` (ссылка на mp4 на серверах fal) и `local_path` (файл уже скачан в папку output ComfyUI).
 
