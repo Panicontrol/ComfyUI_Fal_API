@@ -369,6 +369,15 @@ def _run_request(endpoint, arguments, est_seconds=120):
                      "человека / переноса личности. Повтор не поможет — модель "
                      "не обрабатывает такой материал. Используй синтетических "
                      "персонажей или контент, который проходит их проверку.")
+        if "could not get lora" in low or "failed to download file" in low:
+            text += ("\n  >> fal не смог скачать LoRA по ссылке. Чаще всего это "
+                     "закрытый (gated) репозиторий Hugging Face: файл отдаётся "
+                     "только после входа в аккаунт и принятия лицензии, а у "
+                     "серверов fal токена нет — они получают 403. Скачай "
+                     ".safetensors вручную, положи в ComfyUI/models/loras и "
+                     "выбери его в слоте lora_N — нода зальёт файл в fal сама. "
+                     "Если файл тяжелее 1 ГБ, прогони его через ноду "
+                     "LoRA Convert (fp16 / меньший ранг).")
         return text
 
     def _is_transient(exc):
@@ -1708,10 +1717,52 @@ def _lora_choices():
 _FAL_LORA_LIMIT = 1024 ** 3  # fal не принимает LoRA больше 1 ГБ
 
 
+def _normalize_lora_url(url):
+    """Ссылка на страницу файла -> ссылка на сам файл (Hugging Face blob/resolve)."""
+    if "huggingface.co" in url and "/blob/" in url:
+        url = url.replace("/blob/", "/resolve/", 1)
+    return url
+
+
+def _check_lora_url(url):
+    """Проверяем доступность LoRA ДО отправки задания: fal качает файл со своей
+    стороны без токенов, и закрытые репозитории Hugging Face отдают ему 403.
+    Лучше упасть здесь с понятным текстом, чем через минуту очереди."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=20)
+        if r.status_code in (405, 501):  # HEAD не поддержан — пробуем поток
+            r = requests.get(url, stream=True, timeout=20)
+            r.close()
+        code, ctype = r.status_code, (r.headers.get("Content-Type") or "").lower()
+    except requests.RequestException:
+        return  # сети нет или хост капризничает — не мешаем, решит fal
+    if code in (401, 403):
+        raise RuntimeError(
+            f"LoRA по ссылке недоступна без авторизации (HTTP {code}):\n  {url}\n"
+            f"Скорее всего это закрытый (gated) репозиторий Hugging Face — файл "
+            f"отдаётся только после входа и принятия лицензии. У серверов fal "
+            f"токена нет, поэтому скачать они не смогут.\n"
+            f"Что делать: открой страницу модели, прими условия, скачай "
+            f".safetensors вручную и положи в ComfyUI/models/loras — затем выбери "
+            f"его в слоте lora_N (нода сама зальёт файл в fal storage). Если файл "
+            f"тяжелее 1 ГБ, сначала прогони его через ноду LoRA Convert.")
+    if code == 404:
+        raise RuntimeError(f"LoRA по ссылке не найдена (HTTP 404):\n  {url}")
+    if ctype.startswith("text/html"):
+        raise RuntimeError(
+            f"По ссылке отдаётся веб-страница, а не файл весов:\n  {url}\n"
+            f"Нужна прямая ссылка на .safetensors (на Hugging Face это кнопка "
+            f"download или адрес вида .../resolve/main/имя.safetensors).")
+
+
 def _upload_lora(ref):
-    """ref — URL или локальный путь к .safetensors. URL возвращается как есть,
-    локальный файл грузится в fal storage (с кэшем по mtime/размеру)."""
-    if ref.lower().startswith(("http://", "https://", "data:")):
+    """ref — URL или локальный путь к .safetensors. URL проверяется и уходит в
+    fal как есть, локальный файл грузится в fal storage (кэш по mtime/размеру)."""
+    if ref.lower().startswith(("http://", "https://")):
+        ref = _normalize_lora_url(ref)
+        _check_lora_url(ref)
+        return ref
+    if ref.lower().startswith("data:"):
         return ref
     if not os.path.isfile(ref):
         raise RuntimeError(f"Файл LoRA не найден и это не URL: {ref}")
