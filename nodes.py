@@ -583,12 +583,17 @@ def _run(endpoint, arguments):
     return url
 
 
-def _download(url, prefix):
+def _download(url, prefix, ext=None):
     out_dir = folder_paths.get_output_directory() if folder_paths else tempfile.gettempdir()
     os.makedirs(out_dir, exist_ok=True)
+    if not ext:
+        # расширение берём из URL (без query) — mp4/webm/mov/gif
+        ext = os.path.splitext(url.split("?")[0].split("#")[0])[1].lower()
+        if ext not in (".mp4", ".webm", ".mov", ".gif", ".mkv"):
+            ext = ".mp4"
     idx = 0
     while True:
-        path = os.path.join(out_dir, f"{prefix}_{idx:05d}.mp4")
+        path = os.path.join(out_dir, f"{prefix}_{idx:05d}{ext}")
         if not os.path.exists(path):
             break
         idx += 1
@@ -615,8 +620,8 @@ def _download(url, prefix):
         f"Ссылка (выход video_url): {url}")
 
 
-def _finish(url, prefix):
-    path = _download(url, prefix)
+def _finish(url, prefix, ext=None):
+    path = _download(url, prefix, ext)
     video_obj = VideoFromFile(path) if VideoFromFile else None
     return (video_obj, url, path)
 
@@ -2602,6 +2607,81 @@ def _ltx_dims(video_size, cw, ch, image=None):
     return _LTX_WH.get(video_size, (1024, 576))
 
 
+_LTX_OUTPUT = {
+    "mp4 (H.264)": "X264 (.mp4)",
+    "webm (VP9)": "VP9 (.webm)",
+    "mov (ProRes 4444, без потерь)": "PRORES4444 (.mov)",
+    "gif": "GIF (.gif)",
+}
+_LTX_OUTPUT_EXT = {"X264 (.mp4)": ".mp4", "VP9 (.webm)": ".webm",
+                   "PRORES4444 (.mov)": ".mov", "GIF (.gif)": ".gif"}
+
+
+def _ltx_num(args, key, value, sentinel=-1.0):
+    """Кладёт число в args только если оно не равно «не трогать» (-1).
+    Ноль у некоторых параметров LTX осмысленный, поэтому сентинел именно -1."""
+    if value is not None and value > sentinel:
+        args[key] = float(value)
+
+
+def _ltx_flag(args, key, value):
+    """Тумблер из трёх состояний: default / on / off."""
+    if value == "on":
+        args[key] = True
+    elif value == "off":
+        args[key] = False
+
+
+def _ltx_advanced_inputs():
+    """Продвинутые ручки денойзинга и сэмплера. ВСЕГДА добавляются в конец
+    optional — иначе поедут widgets_values в уже сохранённых воркфлоу."""
+    f = lambda tip, mx=20.0: ("FLOAT", {"default": -1.0, "min": -1.0, "max": mx,
+                                        "step": 0.05, "tooltip": tip + " (-1 — по умолчанию модели)"})
+    return {
+        "use_multiscale": (["default", "on", "off"], {
+            "default": "default",
+            "tooltip": "многомасштабная генерация: лучше связность, дольше счёт"}),
+        "use_restart_sampling": (["default", "on", "off"], {
+            "default": "default",
+            "tooltip": "подмешивание шума на каждом шаге: больше деталей, "
+                       "но менее предсказуемо"}),
+        "gradient_estimation_gamma": ("FLOAT", {
+            "default": -1.0, "min": -1.0, "max": 10.0, "step": 0.1,
+            "tooltip": "градиент денойзинга (по умолчанию 2). 0 — отключить "
+                       "полностью, -1 — не трогать"}),
+        "video_stg_scale": f("STG видео: пространственно-временная направляющая"),
+        "video_rescaling_scale": f("баланс CFG/STG для видео (по умолчанию 0.7)", 1.0),
+        "video_modality_scale": f("вес видео относительно звука (по умолчанию 3)"),
+        "audio_cfg_scale": f("сила направляющей для звука (по умолчанию 7)"),
+        "audio_stg_scale": f("STG звука"),
+        "audio_rescaling_scale": f("баланс CFG/STG для звука (по умолчанию 0.7)", 1.0),
+        "audio_modality_scale": f("вес звука относительно видео (по умолчанию 3)"),
+        "distill_lora_first_pass_scale": f("distill-LoRA, первый проход (0.2)", 2.0),
+        "distill_lora_second_pass_scale": f("distill-LoRA, следующие проходы (0.5)", 2.0),
+        "video_output_type": (list(_LTX_OUTPUT), {
+            "default": "mp4 (H.264)",
+            "tooltip": "ProRes 4444 — для монтажа и композа без потерь "
+                       "(файл в разы тяжелее)"}),
+    }
+
+
+def _ltx_apply_advanced(args, kw):
+    """Переносит продвинутые параметры из kwargs в тело запроса."""
+    _ltx_flag(args, "use_multiscale", kw.get("use_multiscale", "default"))
+    _ltx_flag(args, "use_restart_sampling", kw.get("use_restart_sampling", "default"))
+    _ltx_num(args, "gradient_estimation_gamma",
+             kw.get("gradient_estimation_gamma", -1.0))
+    for key in ("video_stg_scale", "video_rescaling_scale", "video_modality_scale",
+                "audio_cfg_scale", "audio_stg_scale", "audio_rescaling_scale",
+                "audio_modality_scale", "distill_lora_first_pass_scale",
+                "distill_lora_second_pass_scale"):
+        _ltx_num(args, key, kw.get(key, -1.0))
+    out = _LTX_OUTPUT.get(kw.get("video_output_type", "mp4 (H.264)"), "X264 (.mp4)")
+    if out != "X264 (.mp4)":
+        args["video_output_type"] = out
+    return _LTX_OUTPUT_EXT.get(out, ".mp4")
+
+
 def _ltx_cost(w, h, frames, distilled):
     rate = _LTX_RATE_MP["distilled" if distilled else "quality"]
     return rate * (w * h * frames) / 1e6
@@ -2650,6 +2730,7 @@ class LTX23Video:
             "enable_safety_checker": ("BOOLEAN", {"default": True}),
         }
         opt.update(_lora_slot_inputs(3))
+        opt.update(_ltx_advanced_inputs())
         return {
             "required": {
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
@@ -2712,6 +2793,7 @@ class LTX23Video:
             args["camera_lora_scale"] = float(camera_lora_scale)
         if loras:
             args["loras"] = loras
+        ext = _ltx_apply_advanced(args, kw)
         _seed_arg(args, seed)
 
         base = "fal-ai/ltx-2.3-22b" + ("/distilled" if distilled else "")
@@ -2743,7 +2825,7 @@ class LTX23Video:
         url = ((result or {}).get("video") or {}).get("url")
         if not url:
             raise RuntimeError(f"fal не вернул видео: {result}")
-        return _finish(url, "ltx23")
+        return _finish(url, "ltx23", ext)
 
 
 class LTX23ExtendVideo:
@@ -2770,6 +2852,7 @@ class LTX23ExtendVideo:
             "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
         }
         opt.update(_lora_slot_inputs(3))
+        opt.update(_ltx_advanced_inputs())
         return {
             "required": {
                 "video": ("VIDEO",),
@@ -2814,6 +2897,7 @@ class LTX23ExtendVideo:
             args["guidance_scale"] = float(guidance_scale)
         if loras:
             args["loras"] = loras
+        ext = _ltx_apply_advanced(args, kw)
         _seed_arg(args, seed)
 
         endpoint = "fal-ai/ltx-2.3-quality/extend-video" + ("/lora" if loras else "")
@@ -2825,7 +2909,7 @@ class LTX23ExtendVideo:
         url = ((result or {}).get("video") or {}).get("url")
         if not url:
             raise RuntimeError(f"fal не вернул видео: {result}")
-        return _finish(url, "ltx23_extend")
+        return _finish(url, "ltx23_extend", ext)
 
 
 class LTX23Reframe:
