@@ -147,6 +147,16 @@ const CALCS = {
     const frames = Math.round(((v.num_frames || 121) - 1) / 8) * 8 + 1;
     return `≈ ${fmt(0.001605 * (1280 * 720 * frames) / 1e6)}`;  // по 720p
   },
+  MinimaxH3Video_fal: (v) => {
+    const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
+    const d = v.duration_override > 0 ? Math.round(v.duration_override) : (v.duration || 5);
+    return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
+  },
+  MinimaxH3Reference_fal: (v) => {
+    const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
+    const d = v.duration_override > 0 ? Math.round(v.duration_override) : (v.duration || 5);
+    return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
+  },
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);

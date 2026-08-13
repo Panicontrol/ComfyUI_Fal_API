@@ -14,6 +14,8 @@
 | LTX-2.3 Video LoRA (fal) | `fal-ai/ltx-2.3-22b/{text,image,reference-video}-to-video[/lora]` (+`/distilled`) | Видео со звуком, 3 слота LoRA, LoRA камеры, режим по подключённым входам |
 | LTX-2.3 Extend Video (fal) | `fal-ai/ltx-2.3-quality/extend-video[/lora]` | Продолжает ролик вперёд или назад, с LoRA |
 | LTX-2.3 Reframe (fal) | `fal-ai/ltx-2.3/reframe` | Меняет соотношение сторон, дорисовывая кадр (до 60 с) |
+| MiniMax H3 Video LoRA (fal) | `minimax/h3/{text,image}-to-video[/lora]` | Hailuo 3.0: до 4K, 5–15 с, нативное стерео-аудио, LoRA |
+| MiniMax H3 Reference-to-Video (fal) | `minimax/h3/reference-to-video[/lora]` | До 9 картинок + 3 видео + 3 аудио как референсы |
 
 Каждая нода возвращает три выхода: `video` (нативный тип VIDEO — подключается к Save Video / Preview Video), `video_url` (ссылка на mp4 на серверах fal) и `local_path` (файл уже скачан в папку output ComfyUI).
 
