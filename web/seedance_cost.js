@@ -164,6 +164,30 @@ const CALCS = {
   },
 };
 
+// Стартовый размер нод с длинным промптом: многострочные виджеты в ComfyUI
+// делят между собой свободную высоту ноды, поэтому чем выше нода — тем больше
+// поля промпта. Применяется только при создании, сохранённые размеры не трогаем.
+const DEFAULT_SIZE = {
+  MinimaxH3Reference_fal: [520, 900],
+  MinimaxH3Video_fal: [480, 620],
+  LTX23Video_fal: [480, 620],
+  Seedance2ReferenceToVideo_fal: [520, 800],
+};
+
+app.registerExtension({
+  name: "fal.seedance.nodeSize",
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    const size = DEFAULT_SIZE[nodeData.name];
+    if (!size) return;
+    const orig = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      orig?.apply(this, arguments);
+      const cur = this.size || [0, 0];
+      this.setSize([Math.max(cur[0], size[0]), Math.max(cur[1], size[1])]);
+    };
+  },
+});
+
 app.registerExtension({
   name: "fal.seedance.costEstimate",
   beforeRegisterNodeDef(nodeType, nodeData) {

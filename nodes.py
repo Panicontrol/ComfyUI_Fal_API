@@ -14,6 +14,7 @@ API-ключ: переменная окружения FAL_KEY или файл co
 
 import os
 import io
+import re
 import configparser
 import tempfile
 
@@ -322,18 +323,35 @@ def _upload_audio_input(audio):
             pass
 
 
+def _split_media_refs(text):
+    """Разбор поля со ссылками: и многострочного, и однострочного.
+    Разделители — перевод строки, запятая и точка с запятой. Строка вида
+    data:... не режется по запятой, иначе развалится base64."""
+    out = []
+    for line in (str(text) if text is not None else "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("data:"):
+            out.append(line)          # data-URI содержит запятую — не трогаем
+            continue
+        for part in re.split(r"[,;]", line):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
 def _resolve_media_list(text, limit):
-    """Многострочное поле: каждая строка — URL или локальный путь.
+    """Поле со ссылками: URL или локальный путь, по одному на строку либо
+    несколько через запятую.
     Локальные файлы загружаются в fal storage. Строки, не похожие ни на путь,
     ни на URL (например «0» от сдвига виджетов старой ноды), пропускаются
     с предупреждением."""
     urls = []
     if limit is not None and limit <= 0:
         return urls
-    for line in (str(text) if text is not None else "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for line in _split_media_refs(text):
         if line.lower().startswith(("http://", "https://", "data:")):
             urls.append(line)
         elif os.path.isfile(line):
@@ -3128,10 +3146,13 @@ class MinimaxH3Reference:
             "image_3": ("IMAGE",), "image_4": ("IMAGE",),
             "video_1": ("VIDEO",), "video_2": ("VIDEO",), "video_3": ("VIDEO",),
             "audio_1": ("AUDIO",), "audio_2": ("AUDIO",), "audio_3": ("AUDIO",),
-            "image_urls": ("STRING", {"multiline": True, "default": "",
-                                      "tooltip": "по ссылке или пути в строке"}),
-            "video_refs": ("STRING", {"multiline": True, "default": ""}),
-            "audio_refs": ("STRING", {"multiline": True, "default": ""}),
+            # однострочные: несколько ссылок разделяются запятой
+            "image_urls": ("STRING", {"default": "", "tooltip":
+                                      "ссылки или пути, через запятую"}),
+            "video_refs": ("STRING", {"default": "", "tooltip":
+                                      "ссылки или пути, через запятую"}),
+            "audio_refs": ("STRING", {"default": "", "tooltip":
+                                      "ссылки или пути, через запятую"}),
             "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
             "enable_safety_checker": ("BOOLEAN", {"default": True}),
             "duration_override": DURATION_OVERRIDE_INPUT,
