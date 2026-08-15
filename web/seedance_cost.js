@@ -85,6 +85,17 @@ function nanoBananaCost(v) {
   return `≈ ${fmt(per * (v.num_images || 1))}`;
 }
 
+// MiniMax H3: $/с по разрешению. Приоритет длительности тот же, что в ноде:
+// duration_override (секунды) -> duration_frames (кадры при 24 fps) -> duration.
+function h3Cost(v) {
+  const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
+  let d;
+  if (v.duration_override > 0) d = Math.round(v.duration_override);
+  else if (v.duration_frames > 0) d = Math.round(v.duration_frames / 24);
+  else d = v.duration || 5;
+  return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
+}
+
 const CALCS = {
   Seedance2TextToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
   Seedance2ImageToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
@@ -147,16 +158,8 @@ const CALCS = {
     const frames = Math.round(((v.num_frames || 121) - 1) / 8) * 8 + 1;
     return `≈ ${fmt(0.001605 * (1280 * 720 * frames) / 1e6)}`;  // по 720p
   },
-  MinimaxH3Video_fal: (v) => {
-    const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
-    const d = v.duration_override > 0 ? Math.round(v.duration_override) : (v.duration || 5);
-    return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
-  },
-  MinimaxH3Reference_fal: (v) => {
-    const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
-    const d = v.duration_override > 0 ? Math.round(v.duration_override) : (v.duration || 5);
-    return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
-  },
+  MinimaxH3Video_fal: h3Cost,
+  MinimaxH3Reference_fal: h3Cost,
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);

@@ -3035,11 +3035,42 @@ def _h3_cost(resolution, duration):
     return _H3_RATE.get(resolution, 0.13) * max(1, int(duration))
 
 
-def _h3_duration(duration, duration_override):
-    """duration_override (секунды, FLOAT) перекрывает виджет. Лимит H3 — 5..15."""
+_H3_FPS = 24  # частота у H3 фиксированная
+
+
+_H3_FRAMES_INPUT = ("INT", {
+    "default": 0, "min": 0, "max": 400,
+    "tooltip": "0 — не использовать. Длительность в кадрах: пересчитывается в "
+               "секунды по 24 fps и округляется. API принимает только целые "
+               "секунды, поэтому точного совпадения с плейтом может не быть — "
+               "нода напишет в лог, сколько кадров получится на самом деле"})
+
+
+def _h3_duration(duration, duration_override, duration_frames=0):
+    """Секунды для H3. Приоритет: duration_override (провод, секунды) ->
+    duration_frames (кадры при 24 fps) -> виджет duration. Лимит 5..15 с."""
+    frames = int(duration_frames or 0)
+    from_frames = False
     if duration_override is not None and duration_override > 0:
         duration = int(round(duration_override))
-    return max(5, min(15, int(duration)))
+        if frames > 0:
+            print("[fal H3] заданы и duration_override, и duration_frames — "
+                  "беру duration_override (секунды)")
+    elif frames > 0:
+        duration = int(round(frames / _H3_FPS))
+        from_frames = True
+    dur = max(5, min(15, int(duration)))
+    if from_frames:
+        out = dur * _H3_FPS
+        if out == frames:
+            print(f"[fal H3] {frames} кадров = ровно {dur} с при {_H3_FPS} fps")
+        else:
+            word = "короче" if out < frames else "длиннее"
+            print(f"[fal H3] запрошено {frames} кадров -> {dur} с = {out} кадров "
+                  f"при {_H3_FPS} fps, это на {abs(out - frames)} кадр(ов) {word}. "
+                  f"API принимает только целые секунды — подрежь результат в "
+                  f"монтаже или возьми на секунду больше с запасом")
+    return dur
 
 
 class MinimaxH3Video:
@@ -3066,6 +3097,7 @@ class MinimaxH3Video:
             "duration_override": DURATION_OVERRIDE_INPUT,
         }
         opt.update(_lora_slot_inputs(3))
+        opt["duration_frames"] = _H3_FRAMES_INPUT
         return {
             "required": {
                 "prompt": ("STRING", {
@@ -3091,10 +3123,10 @@ class MinimaxH3Video:
     def generate(self, prompt, duration=5, resolution="2K", aspect_ratio="16:9",
                  image=None, end_image=None, seed=-1,
                  enable_prompt_expansion=True, enable_safety_checker=True,
-                 duration_override=0.0, **kw):
+                 duration_override=0.0, duration_frames=0, **kw):
         _require_deps()
         loras = _build_loras(kw, 3)
-        dur = _h3_duration(duration, duration_override)
+        dur = _h3_duration(duration, duration_override, duration_frames)
         args = {
             "prompt": prompt,
             "duration": dur,
@@ -3158,6 +3190,7 @@ class MinimaxH3Reference:
             "duration_override": DURATION_OVERRIDE_INPUT,
         }
         opt.update(_lora_slot_inputs(3))
+        opt["duration_frames"] = _H3_FRAMES_INPUT
         return {
             "required": {
                 "prompt": ("STRING", {
@@ -3185,10 +3218,10 @@ class MinimaxH3Reference:
                  audio_1=None, audio_2=None, audio_3=None,
                  image_urls="", video_refs="", audio_refs="",
                  enable_prompt_expansion=True, enable_safety_checker=True,
-                 duration_override=0.0, **kw):
+                 duration_override=0.0, duration_frames=0, **kw):
         _require_deps()
         loras = _build_loras(kw, 3)
-        dur = _h3_duration(duration, duration_override)
+        dur = _h3_duration(duration, duration_override, duration_frames)
 
         img_urls = []
         for img in (image_1, image_2, image_3, image_4):
