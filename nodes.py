@@ -3073,6 +3073,51 @@ def _h3_duration(duration, duration_override, duration_frames=0):
     return dur
 
 
+def _h3_collect_refs(images, videos, audios,
+                     image_urls="", video_refs="", audio_refs=""):
+    """Сборка мультимодальных референсов H3 / H3 Max в три массива URL.
+    Лимиты одинаковые у обеих моделей: до 9 картинок, до 3 видео и до 3 аудио,
+    всего не больше 12 файлов; видео суммарно не длиннее 15 с; аудио не может
+    быть единственным референсом."""
+    img_urls = []
+    for img in images:
+        if img is not None and len(img_urls) < 9:
+            img_urls += _upload_image_input(img, 9 - len(img_urls))
+    img_urls += _resolve_media_list(image_urls, 9 - len(img_urls))
+
+    vid_urls, vid_total = [], 0.0
+    for i, vid in enumerate(videos, 1):
+        if vid is not None and len(vid_urls) < 3:
+            url, d, _, _ = _upload_video_input(vid, label=f"video_{i}")
+            if d:
+                vid_total += d
+            vid_urls.append(url)
+    if vid_total > 15.0:
+        raise RuntimeError(
+            f"Суммарная длительность референс-видео {vid_total:.1f} с — "
+            f"больше лимита H3 (2–15 с суммарно). Подрежь ролики.")
+    vid_urls += _resolve_media_list(video_refs, 3 - len(vid_urls))
+
+    aud_urls = []
+    for aud in audios:
+        if aud is not None and len(aud_urls) < 3:
+            aud_urls.append(_upload_audio_input(aud))
+    aud_urls += _resolve_media_list(audio_refs, 3 - len(aud_urls))
+
+    if not img_urls and not vid_urls:
+        raise RuntimeError(
+            "H3 не принимает аудио как единственный референс: подключи "
+            "хотя бы одну картинку или видео." if aud_urls else
+            "Не задано ни одного референса — подключи картинку, видео "
+            "или укажи ссылки в image_urls / video_refs.")
+    total = len(img_urls) + len(vid_urls) + len(aud_urls)
+    if total > 12:
+        raise RuntimeError(
+            f"Всего референсов {total}, а H3 принимает максимум 12 файлов "
+            f"(из них до 9 картинок, до 3 видео и до 3 аудио).")
+    return img_urls, vid_urls, aud_urls
+
+
 class MinimaxH3Video:
     """MiniMax H3 (Hailuo 3.0) — 24 fps, до 4K, нативное стерео-аудио
     (музыка, диалоги, фоли, эмбиенс) прямо из промпта.
@@ -3223,42 +3268,10 @@ class MinimaxH3Reference:
         loras = _build_loras(kw, 3)
         dur = _h3_duration(duration, duration_override, duration_frames)
 
-        img_urls = []
-        for img in (image_1, image_2, image_3, image_4):
-            if img is not None and len(img_urls) < 9:
-                img_urls += _upload_image_input(img, 9 - len(img_urls))
-        img_urls += _resolve_media_list(image_urls, 9 - len(img_urls))
-
-        vid_urls, vid_total = [], 0.0
-        for i, vid in enumerate((video_1, video_2, video_3), 1):
-            if vid is not None and len(vid_urls) < 3:
-                url, d, _, _ = _upload_video_input(vid, label=f"video_{i}")
-                if d:
-                    vid_total += d
-                vid_urls.append(url)
-        if vid_total > 15.0:
-            raise RuntimeError(
-                f"Суммарная длительность референс-видео {vid_total:.1f} с — "
-                f"больше лимита H3 (2–15 с суммарно). Подрежь ролики.")
-        vid_urls += _resolve_media_list(video_refs, 3 - len(vid_urls))
-
-        aud_urls = []
-        for aud in (audio_1, audio_2, audio_3):
-            if aud is not None and len(aud_urls) < 3:
-                aud_urls.append(_upload_audio_input(aud))
-        aud_urls += _resolve_media_list(audio_refs, 3 - len(aud_urls))
-
-        if not img_urls and not vid_urls:
-            raise RuntimeError(
-                "H3 не принимает аудио как единственный референс: подключи "
-                "хотя бы одну картинку или видео." if aud_urls else
-                "Не задано ни одного референса — подключи картинку, видео "
-                "или укажи ссылки в image_urls / video_refs.")
-        total = len(img_urls) + len(vid_urls) + len(aud_urls)
-        if total > 12:
-            raise RuntimeError(
-                f"Всего референсов {total}, а H3 принимает максимум 12 файлов "
-                f"(из них до 9 картинок, до 3 видео и до 3 аудио).")
+        img_urls, vid_urls, aud_urls = _h3_collect_refs(
+            (image_1, image_2, image_3, image_4),
+            (video_1, video_2, video_3), (audio_1, audio_2, audio_3),
+            image_urls, video_refs, audio_refs)
 
         args = {
             "prompt": prompt,
@@ -3289,6 +3302,226 @@ class MinimaxH3Reference:
         return _finish(url, "minimax_h3_ref")
 
 
+# ---------------------------------------------------------------------------
+# MiniMax H3 Max — пост-тренированный fal вариант H3: сильнее следует промпту,
+# быстрее реального времени. Turbo — ещё быстрее и вдвое дешевле.
+# ---------------------------------------------------------------------------
+
+_H3MAX_RES = ["768P", "480P"]
+_H3MAX_MODELS = ["H3 Max", "H3 Max Turbo (быстрее и вдвое дешевле)"]
+_H3MAX_EXPANSION = ["balanced", "quality"]
+_H3MAX_ASPECTS = _H3_ASPECTS
+
+# $ за секунду видео (базовый тариф после стартовой промо-скидки)
+_H3MAX_RATE = {
+    "max": {"480P": 0.05, "768P": 0.08},
+    "turbo": {"480P": 0.025, "768P": 0.04},
+}
+
+# у H3 Max, в отличие от H3, есть ещё и текст раскрытого промпта на выходе
+_H3MAX_RETURN_TYPES = RETURN_TYPES + ("STRING",)
+_H3MAX_RETURN_NAMES = RETURN_NAMES + ("expanded_prompt",)
+
+
+def _h3max_tier(model):
+    return "turbo" if "Turbo" in model else "max"
+
+
+def _h3max_cost(model, resolution, duration):
+    table = _H3MAX_RATE[_h3max_tier(model)]
+    return table.get(resolution, table["768P"]) * max(1, int(duration))
+
+
+def _h3max_finish(result, prefix, endpoint):
+    """Общий разбор ответа H3 Max: видео + раскрытый промпт."""
+    url = ((result or {}).get("video") or {}).get("url")
+    if not url:
+        raise RuntimeError(f"fal не вернул видео: {result}")
+    expanded = (result or {}).get("expanded_prompt") or ""
+    if expanded:
+        print(f"[fal {endpoint}] промпт после раскрытия: {expanded[:300]}"
+              f"{'…' if len(expanded) > 300 else ''}")
+    timings = (result or {}).get("timings")
+    if timings:
+        print(f"[fal {endpoint}] тайминги: {timings}")
+    return _finish(url, prefix) + (expanded,)
+
+
+class MinimaxH3MaxVideo:
+    """MiniMax H3 Max — пост-тренированный fal вариант H3: лучше следует
+    промпту и аккуратнее по картинке, считается быстрее реального времени
+    (5 с в 768P — за пару секунд). Звук синхронный, как у обычного H3.
+
+    Без картинки — text-to-video, с подключённой image — image-to-video,
+    end_image задаёт последний кадр. В режиме с картинкой пропорции берутся
+    из неё, aspect_ratio не отправляется.
+
+    Отличия от обычного H3: только 480P и 768P (нет 2K/4K), нет поддержки
+    LoRA, вместо тумблера расширения промпта — режим balanced/quality.
+    Цена: $0.05/$0.08 за секунду (480P/768P), Turbo — вдвое дешевле."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "звук описывается здесь же: музыка, реплики, шумы"}),
+                "model": (_H3MAX_MODELS, {"default": _H3MAX_MODELS[0]}),
+                "duration": ("INT", {"default": 5, "min": 5, "max": 15}),
+                "resolution": (_H3MAX_RES, {"default": "768P"}),
+                "aspect_ratio": (_H3MAX_ASPECTS, {
+                    "default": "16:9",
+                    "tooltip": "игнорируется в режиме image-to-video — "
+                               "пропорции берутся из картинки"}),
+                "prompt_expansion_mode": (_H3MAX_EXPANSION, {
+                    "default": "balanced",
+                    "tooltip": "balanced — раскрытие промпта за ~1 с; "
+                               "quality — тщательнее, но добавляет ~30 с"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "первый кадр -> image-to-video"}),
+                "end_image": ("IMAGE", {"tooltip": "последний кадр (нужна image)"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "duration_frames": _H3_FRAMES_INPUT,
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/MiniMax"
+
+    def generate(self, prompt, model=_H3MAX_MODELS[0], duration=5,
+                 resolution="768P", aspect_ratio="16:9",
+                 prompt_expansion_mode="balanced", image=None, end_image=None,
+                 seed=-1, enable_safety_checker=True,
+                 duration_override=0.0, duration_frames=0):
+        _require_deps()
+        dur = _h3_duration(duration, duration_override, duration_frames)
+        args = {
+            "prompt": prompt,
+            "duration": dur,
+            "resolution": resolution,
+            "prompt_expansion_mode": prompt_expansion_mode,
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        _seed_arg(args, seed)
+
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            if end_image is not None:
+                args["end_image_url"] = _upload_image_input(end_image, 1)[0]
+            task = "image-to-video"
+        else:
+            if end_image is not None:
+                raise RuntimeError(
+                    "end_image задаёт последний кадр и работает только вместе "
+                    "с image — подключи стартовый кадр во вход image.")
+            args["aspect_ratio"] = aspect_ratio
+            task = "text-to-video"
+        base = "minimax/h3-max-turbo" if _h3max_tier(model) == "turbo" else "minimax/h3-max"
+        endpoint = f"{base}/{task}"
+
+        print(f"[fal {endpoint}] {resolution}, {dur} с, "
+              f"раскрытие промпта: {prompt_expansion_mode}, ориентировочная "
+              f"стоимость ~${_h3max_cost(model, resolution, dur):.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(20, dur * 2 + 10))
+        return _h3max_finish(result, "minimax_h3max", endpoint)
+
+
+class MinimaxH3MaxReference:
+    """MiniMax H3 Max Reference-to-Video — мультимодальные референсы на
+    пост-тренированной модели: до 9 картинок, до 3 видео и до 3 аудио
+    (всего не больше 12 файлов).
+
+    В промпте на них ссылаются как «Image 1», «Video 1», «Audio 1» — нумерация
+    идёт по порядку: сначала входы image_1..image_4, затем строки image_urls.
+    Видео и аудио — по 2–15 с каждое. Аудио не может быть единственным
+    референсом. У Turbo этого режима нет, только у обычного H3 Max."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "дай каждому референсу роль: «Image 1 — костюм», "
+                               "«Video 1 — движение камеры»"}),
+                "duration": ("INT", {"default": 5, "min": 5, "max": 15}),
+                "resolution": (_H3MAX_RES, {"default": "768P"}),
+                "aspect_ratio": (["adaptive"] + _H3MAX_ASPECTS, {
+                    "default": "adaptive",
+                    "tooltip": "adaptive — взять пропорции из референсов"}),
+                "prompt_expansion_mode": (_H3MAX_EXPANSION, {
+                    "default": "balanced",
+                    "tooltip": "quality тщательнее, но добавляет ~30 с"}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",), "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",), "image_4": ("IMAGE",),
+                "video_1": ("VIDEO",), "video_2": ("VIDEO",), "video_3": ("VIDEO",),
+                "audio_1": ("AUDIO",), "audio_2": ("AUDIO",), "audio_3": ("AUDIO",),
+                "image_urls": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "video_refs": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "audio_refs": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+                "duration_frames": _H3_FRAMES_INPUT,
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/MiniMax"
+
+    def generate(self, prompt, duration=5, resolution="768P",
+                 aspect_ratio="adaptive", prompt_expansion_mode="balanced",
+                 image_1=None, image_2=None, image_3=None, image_4=None,
+                 video_1=None, video_2=None, video_3=None,
+                 audio_1=None, audio_2=None, audio_3=None,
+                 image_urls="", video_refs="", audio_refs="", seed=-1,
+                 enable_safety_checker=True, duration_override=0.0,
+                 duration_frames=0):
+        _require_deps()
+        dur = _h3_duration(duration, duration_override, duration_frames)
+        img_urls, vid_urls, aud_urls = _h3_collect_refs(
+            (image_1, image_2, image_3, image_4),
+            (video_1, video_2, video_3), (audio_1, audio_2, audio_3),
+            image_urls, video_refs, audio_refs)
+
+        args = {
+            "prompt": prompt,
+            "duration": dur,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "prompt_expansion_mode": prompt_expansion_mode,
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        if img_urls:
+            args["reference_image_urls"] = img_urls
+        if vid_urls:
+            args["reference_video_urls"] = vid_urls
+        if aud_urls:
+            args["reference_audio_urls"] = aud_urls
+        _seed_arg(args, seed)
+
+        endpoint = "minimax/h3-max/reference-to-video"
+        print(f"[fal {endpoint}] {resolution}, {dur} с, референсы: "
+              f"{len(img_urls)} картинок / {len(vid_urls)} видео / "
+              f"{len(aud_urls)} аудио, ориентировочная стоимость "
+              f"~${_h3max_cost('H3 Max', resolution, dur):.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(20, dur * 2 + 10))
+        return _h3max_finish(result, "minimax_h3max_ref", endpoint)
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -3317,6 +3550,8 @@ NODE_CLASS_MAPPINGS = {
     "LTX23Reframe_fal": LTX23Reframe,
     "MinimaxH3Video_fal": MinimaxH3Video,
     "MinimaxH3Reference_fal": MinimaxH3Reference,
+    "MinimaxH3MaxVideo_fal": MinimaxH3MaxVideo,
+    "MinimaxH3MaxReference_fal": MinimaxH3MaxReference,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -3347,4 +3582,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX23Reframe_fal": "LTX-2.3 Reframe (fal)",
     "MinimaxH3Video_fal": "MiniMax H3 Video LoRA (fal)",
     "MinimaxH3Reference_fal": "MiniMax H3 Reference-to-Video (fal)",
+    "MinimaxH3MaxVideo_fal": "MiniMax H3 Max Video (fal)",
+    "MinimaxH3MaxReference_fal": "MiniMax H3 Max Reference-to-Video (fal)",
 }

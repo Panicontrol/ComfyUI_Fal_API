@@ -89,11 +89,27 @@ function nanoBananaCost(v) {
 // duration_override (секунды) -> duration_frames (кадры при 24 fps) -> duration.
 function h3Cost(v) {
   const rate = { "768P": 0.08, "2K": 0.13, "4K": 0.16 }[v.resolution] ?? 0.13;
+  return `≈ ${fmt(rate * h3Seconds(v))}`;
+}
+
+// H3 Max: $/с по разрешению; Turbo вдвое дешевле. Базовый тариф после промо.
+const H3MAX_RATE = {
+  max: { "480P": 0.05, "768P": 0.08 },
+  turbo: { "480P": 0.025, "768P": 0.04 },
+};
+
+function h3Seconds(v) {
   let d;
   if (v.duration_override > 0) d = Math.round(v.duration_override);
   else if (v.duration_frames > 0) d = Math.round(v.duration_frames / 24);
   else d = v.duration || 5;
-  return `≈ ${fmt(rate * Math.max(5, Math.min(15, d)))}`;
+  return Math.max(5, Math.min(15, d));
+}
+
+function h3MaxCost(v) {
+  const tier = String(v.model || "").includes("Turbo") ? "turbo" : "max";
+  const rate = H3MAX_RATE[tier][v.resolution] ?? H3MAX_RATE[tier]["768P"];
+  return `≈ ${fmt(rate * h3Seconds(v))}`;
 }
 
 const CALCS = {
@@ -160,6 +176,8 @@ const CALCS = {
   },
   MinimaxH3Video_fal: h3Cost,
   MinimaxH3Reference_fal: h3Cost,
+  MinimaxH3MaxVideo_fal: h3MaxCost,
+  MinimaxH3MaxReference_fal: (v) => h3MaxCost({ ...v, model: "H3 Max" }),
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);
@@ -172,6 +190,8 @@ const CALCS = {
 // поля промпта. Применяется только при создании, сохранённые размеры не трогаем.
 const DEFAULT_SIZE = {
   MinimaxH3Reference_fal: [520, 900],
+  MinimaxH3MaxReference_fal: [520, 900],
+  MinimaxH3MaxVideo_fal: [480, 620],
   MinimaxH3Video_fal: [480, 620],
   LTX23Video_fal: [480, 620],
   Seedance2ReferenceToVideo_fal: [520, 800],
