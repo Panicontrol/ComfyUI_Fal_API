@@ -10,6 +10,20 @@ const S2_RATE = 0.014 / 1000;        // $ за токен (standard, звук б
 const S2_FAST_RATE = 0.0112 / 1000;  // $ за токен (fast)
 const S15_AUDIO_RATE = 2.4 / 1e6;    // $ за токен со звуком
 const S15_RATE = 1.2 / 1e6;          // $ за токен без звука
+const S25_RATE = 0.0214 / 1000;      // Seedance 2.5: ~$0.46/с на 720p
+
+// Seedance 2.5: в токены входит и длительность входного видео, а при наличии
+// видео-референса цена умножается на 0.6. Длительность входа фронтенду
+// неизвестна, поэтому оценка считается только по выходной.
+function seedance25Cost(v, { ref = false } = {}) {
+  const [w, h] = pxDims(v.resolution, v.aspect_ratio);
+  const perSec = ((w * h * 24) / 1024) * S25_RATE;
+  const dur = v.duration;
+  if (dur === "auto" || dur === undefined || dur === null) {
+    return `≈ ${fmt(perSec * 4)}–${fmt(perSec * 30)}`;
+  }
+  return `≈ ${fmt(perSec * parseInt(dur, 10))}${ref ? " ×0.6 c видео" : ""}`;
+}
 
 // GPT Image 2: $ за изображение (пиксели -> {low, medium, high})
 const GPT_PRICES = [
@@ -116,6 +130,8 @@ const CALCS = {
   Seedance2TextToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
   Seedance2ImageToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
   Seedance2ReferenceToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
+  Seedance25Video_fal: (v) => seedance25Cost(v),
+  Seedance25Reference_fal: (v) => seedance25Cost(v, { ref: true }),
   Seedance15ProTextToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   Seedance15ProImageToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   GPTImage2TextToImage_fal: gptCost,
@@ -195,6 +211,7 @@ const DEFAULT_SIZE = {
   MinimaxH3Video_fal: [480, 620],
   LTX23Video_fal: [480, 620],
   Seedance2ReferenceToVideo_fal: [520, 800],
+  Seedance25Reference_fal: [520, 820],
 };
 
 app.registerExtension({

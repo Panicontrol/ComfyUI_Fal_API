@@ -530,6 +530,7 @@ _SEEDANCE2_RATE = 0.014 / 1000       # $ за токен (standard)
 _SEEDANCE2_FAST_RATE = 0.0112 / 1000  # $ за токен (fast, ~$0.2419/с на 720p)
 _SEEDANCE15_AUDIO_RATE = 2.4 / 1e6    # $ за токен со звуком
 _SEEDANCE15_RATE = 1.2 / 1e6          # $ за токен без звука
+_SEEDANCE25_RATE = 0.0214 / 1000      # $ за токен (~$0.46/с на 720p)
 
 # GPT Image 2: $ за изображение (пиксели -> {low, medium, high})
 _GPT_PRICES = [
@@ -562,9 +563,22 @@ def _px_dims(resolution, aspect_ratio):
     return w, h
 
 
-def _video_cost_text(endpoint, args):
+def _video_cost_text(endpoint, args, extra_seconds=0.0, multiplier=1.0):
+    """extra_seconds — оплачиваемая длительность входного видео (Seedance 2.5
+    считает её вместе с выходной), multiplier — скидочный коэффициент 0.6,
+    который 2.5 применяет, если подан хотя бы один видео-референс."""
     w, h = _px_dims(args.get("resolution", "720p"), args.get("aspect_ratio"))
     tokens_per_sec = w * h * 24 / 1024
+    if "seedance-2.5" in endpoint:
+        per_sec = tokens_per_sec * _SEEDANCE25_RATE * multiplier
+        base = per_sec * extra_seconds          # входное видео оплачивается тоже
+        dur = args.get("duration")
+        tail = (f", вход {extra_seconds:.1f} с" if extra_seconds else "") + \
+               (" x0.6 за видео-референс" if multiplier != 1.0 else "")
+        if dur in (None, "auto"):
+            return (f"~${base + per_sec * 4:.2f}–${base + per_sec * 30:.2f} "
+                    f"(auto, 4–30 с{tail})")
+        return f"~${base + per_sec * int(dur):.2f} ({dur} с{tail})"
     if "seedance-2.0" in endpoint:
         per_sec = tokens_per_sec * (_SEEDANCE2_FAST_RATE if "/fast/" in endpoint
                                     else _SEEDANCE2_RATE)
@@ -3522,12 +3536,267 @@ class MinimaxH3MaxReference:
         return _h3max_finish(result, "minimax_h3max_ref", endpoint)
 
 
+# ---------------------------------------------------------------------------
+# Seedance 2.5 — до 30 секунд одним дублем, до 50 мультимодальных референсов
+# ---------------------------------------------------------------------------
+
+DURATIONS_25 = ["auto"] + [str(i) for i in range(4, 31)]   # auto, 4..30
+ASPECTS_25 = ASPECTS_20                                    # auto + 6 пропорций
+_SD25_RES = ["720p", "480p", "1080p"]
+_SD25_BITRATE = ["standard", "high"]
+
+# лимиты референсов: картинки / видео / аудио и общий потолок файлов
+_SD25_MAX_IMG, _SD25_MAX_VID, _SD25_MAX_AUD, _SD25_MAX_TOTAL = 30, 10, 10, 50
+_SD25_CLIP_MIN, _SD25_CLIP_MAX = 1.8, 30.2   # длительность одного клипа, с
+
+
+def _sd25_check_resolution(resolution):
+    """1080p есть в enum схемы, но документация fal обещает только 480p/720p —
+    предупреждаем, чтобы отказ не выглядел багом ноды."""
+    if resolution == "1080p":
+        print("[fal seedance-2.5] ВНИМАНИЕ: 1080p присутствует в схеме API, но "
+              "в документации fal у Seedance 2.5 заявлены только 480p и 720p. "
+              "Запрос может быть отклонён — если так, переключись на 720p.")
+
+
+def _sd25_collect_refs(images, videos, audios,
+                       image_urls="", video_refs="", audio_refs=""):
+    """Референсы Seedance 2.5: до 30 картинок, 10 видео, 10 аудио, всего <= 50.
+    Возвращает (картинки, видео, аудио, суммарная длительность видео)."""
+    img_urls = []
+    for img in images:
+        if img is not None and len(img_urls) < _SD25_MAX_IMG:
+            img_urls += _upload_image_input(img, _SD25_MAX_IMG - len(img_urls))
+    img_urls += _resolve_media_list(image_urls, _SD25_MAX_IMG - len(img_urls))
+
+    vid_urls, vid_total = [], 0.0
+    for i, vid in enumerate(videos, 1):
+        if vid is not None and len(vid_urls) < _SD25_MAX_VID:
+            url, d, _, _ = _upload_video_input(vid, label=f"video_{i}",
+                                               min_duration=None)
+            if d:
+                if d < _SD25_CLIP_MIN:
+                    raise RuntimeError(
+                        f"Референс-видео video_{i} длится {d:.2f} с — Seedance "
+                        f"2.5 принимает клипы от {_SD25_CLIP_MIN} с. Похоже, во "
+                        f"вход попал одиночный кадр или слишком короткий кусок.")
+                if d > _SD25_CLIP_MAX:
+                    print(f"[fal] video_{i} длится {d:.1f} с — больше лимита "
+                          f"{_SD25_CLIP_MAX} с на клип, fal может отклонить")
+                vid_total += d
+            vid_urls.append(url)
+    vid_urls += _resolve_media_list(video_refs, _SD25_MAX_VID - len(vid_urls))
+    if vid_total > _SD25_CLIP_MAX:
+        print(f"[fal] суммарная длительность референс-видео {vid_total:.1f} с — "
+              f"по документации пул видео рассчитан примерно на 30 с, "
+              f"возможен отказ")
+
+    aud_urls = []
+    for aud in audios:
+        if aud is not None and len(aud_urls) < _SD25_MAX_AUD:
+            aud_urls.append(_upload_audio_input(aud))
+    aud_urls += _resolve_media_list(audio_refs, _SD25_MAX_AUD - len(aud_urls))
+
+    if not img_urls and not vid_urls and not aud_urls:
+        raise RuntimeError(
+            "Не задано ни одного референса — подключи картинку, видео или "
+            "аудио, либо укажи ссылки в image_urls / video_refs / audio_refs.")
+    total = len(img_urls) + len(vid_urls) + len(aud_urls)
+    if total > _SD25_MAX_TOTAL:
+        raise RuntimeError(
+            f"Всего референсов {total}, а Seedance 2.5 принимает максимум "
+            f"{_SD25_MAX_TOTAL} файлов (до {_SD25_MAX_IMG} картинок, "
+            f"{_SD25_MAX_VID} видео и {_SD25_MAX_AUD} аудио).")
+    return img_urls, vid_urls, aud_urls, vid_total
+
+
+def _run25(endpoint, args, extra_seconds=0.0, multiplier=1.0):
+    """Запуск Seedance 2.5. Возвращает (url, seed) — сид приходит в ответе."""
+    print(f"[fal {endpoint}] ориентировочная стоимость: "
+          f"{_video_cost_text(endpoint, args, extra_seconds, multiplier)}")
+    est = _est_video_seconds(args.get("duration"), ref="reference" in endpoint)
+    result = _run_request(endpoint, args, est)
+    url = ((result or {}).get("video") or {}).get("url")
+    if not url:
+        raise RuntimeError(f"fal не вернул видео: {result}")
+    seed_out = (result or {}).get("seed")
+    if seed_out is not None:
+        print(f"[fal {endpoint}] seed результата: {seed_out}")
+    return url, int(seed_out) if seed_out is not None else -1
+
+
+_SD25_RETURN_TYPES = RETURN_TYPES + ("INT",)
+_SD25_RETURN_NAMES = RETURN_NAMES + ("seed",)
+
+
+class Seedance25Video:
+    """Seedance 2.5 — до 30 секунд одним непрерывным дублем (у 2.0 было 15),
+    синхронный звук, семь пропорций.
+
+    Без картинки — text-to-video, с подключённой image — image-to-video,
+    end_image задаёт последний кадр. В режиме с картинкой пропорции берутся
+    из неё: API принимает там только aspect_ratio = auto, поэтому виджет
+    не отправляется.
+
+    Сид на вход не принимается (в отличие от 2.0) — модель выбирает его сама
+    и возвращает в выходе seed. Цена: $0.0214 за 1000 токенов,
+    токены = ширина x высота x секунды x 24 / 1024, то есть примерно
+    $0.46/с в 720p и $0.21/с в 480p. Звук на цену не влияет."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "resolution": (_SD25_RES, {"default": "720p"}),
+                "duration": (DURATIONS_25, {
+                    "default": "auto",
+                    "tooltip": "auto или 4–30 с. Тридцать секунд в 720p "
+                               "стоят около $14 — смотри оценку в заголовке"}),
+                "aspect_ratio": (ASPECTS_25, {
+                    "default": "16:9",
+                    "tooltip": "игнорируется, если подключена image — "
+                               "пропорции берутся из картинки"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "bitrate_mode": (_SD25_BITRATE, {
+                    "default": "standard",
+                    "tooltip": "high — выше битрейт выходного файла, "
+                               "на стоимость не влияет"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "первый кадр -> image-to-video"}),
+                "end_image": ("IMAGE", {"tooltip": "последний кадр (нужна image)"}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+            },
+        }
+
+    RETURN_TYPES = _SD25_RETURN_TYPES
+    RETURN_NAMES = _SD25_RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, prompt, resolution="720p", duration="auto",
+                 aspect_ratio="16:9", generate_audio=True,
+                 bitrate_mode="standard", image=None, end_image=None,
+                 duration_override=0.0):
+        _require_deps()
+        _sd25_check_resolution(resolution)
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 30),
+            "generate_audio": bool(generate_audio),
+            "bitrate_mode": bitrate_mode,
+        }
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+            if end_image is not None:
+                args["end_image_url"] = _upload_image_input(end_image, 1)[0]
+            endpoint = "bytedance/seedance-2.5/image-to-video"
+        else:
+            if end_image is not None:
+                raise RuntimeError(
+                    "end_image задаёт последний кадр и работает только вместе "
+                    "с image — подключи стартовый кадр во вход image.")
+            args["aspect_ratio"] = aspect_ratio
+            endpoint = "bytedance/seedance-2.5/text-to-video"
+        url, seed_out = _run25(endpoint, args)
+        return _finish(url, "seedance25") + (seed_out,)
+
+
+class Seedance25Reference:
+    """Seedance 2.5 Reference-to-Video — до 30 картинок, 10 видео и 10 аудио,
+    всего не больше 50 файлов (у 2.0 было 9/3/3 и потолок 12).
+
+    В промпте на референсы ссылаются как @Image1, @Video1, @Audio1 —
+    нумерация идёт по порядку: сначала входы image_1..image_4, затем строки
+    image_urls. Клипы видео и аудио — от 1.8 до 30.2 секунд каждый.
+
+    Тарификация отличается от обычной: в токены входит и длительность
+    входного видео, а если подан хотя бы один видео-референс, итоговая цена
+    умножается на 0.6."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "ссылки на референсы: @Image1, @Video1, @Audio1"}),
+                "resolution": (_SD25_RES, {"default": "720p"}),
+                "duration": (DURATIONS_25, {"default": "auto"}),
+                "aspect_ratio": (ASPECTS_25, {"default": "auto"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "bitrate_mode": (_SD25_BITRATE, {"default": "standard"}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",), "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",), "image_4": ("IMAGE",),
+                "video_1": ("VIDEO",), "video_2": ("VIDEO",), "video_3": ("VIDEO",),
+                "audio_1": ("AUDIO",), "audio_2": ("AUDIO",), "audio_3": ("AUDIO",),
+                "image_urls": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "video_refs": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "audio_refs": ("STRING", {"default": "", "tooltip":
+                                          "ссылки или пути, через запятую"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "duration_override": DURATION_OVERRIDE_INPUT,
+            },
+        }
+
+    RETURN_TYPES = _SD25_RETURN_TYPES
+    RETURN_NAMES = _SD25_RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(self, prompt, resolution="720p", duration="auto",
+                 aspect_ratio="auto", generate_audio=True,
+                 bitrate_mode="standard",
+                 image_1=None, image_2=None, image_3=None, image_4=None,
+                 video_1=None, video_2=None, video_3=None,
+                 audio_1=None, audio_2=None, audio_3=None,
+                 image_urls="", video_refs="", audio_refs="",
+                 seed=-1, duration_override=0.0):
+        _require_deps()
+        _sd25_check_resolution(resolution)
+        img_urls, vid_urls, aud_urls, vid_total = _sd25_collect_refs(
+            (image_1, image_2, image_3, image_4),
+            (video_1, video_2, video_3), (audio_1, audio_2, audio_3),
+            image_urls, video_refs, audio_refs)
+
+        args = {
+            "prompt": prompt,
+            "resolution": resolution,
+            "duration": _duration_value(duration, duration_override, 4, 30),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": bool(generate_audio),
+            "bitrate_mode": bitrate_mode,
+        }
+        if img_urls:
+            args["image_urls"] = img_urls
+        if vid_urls:
+            args["video_urls"] = vid_urls
+        if aud_urls:
+            args["audio_urls"] = aud_urls
+        _seed_arg(args, seed)
+
+        print(f"[fal] референсы Seedance 2.5: {len(img_urls)} картинок / "
+              f"{len(vid_urls)} видео / {len(aud_urls)} аудио")
+        url, seed_out = _run25("bytedance/seedance-2.5/reference-to-video", args,
+                               extra_seconds=vid_total,
+                               multiplier=0.6 if vid_urls else 1.0)
+        return _finish(url, "seedance25_ref") + (seed_out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
     "Seedance2ReferenceToVideo_fal": Seedance2ReferenceToVideo,
     "Seedance15ProTextToVideo_fal": Seedance15ProTextToVideo,
     "Seedance15ProImageToVideo_fal": Seedance15ProImageToVideo,
+    "Seedance25Video_fal": Seedance25Video,
+    "Seedance25Reference_fal": Seedance25Reference,
     "GPTImage2TextToImage_fal": GPTImage2TextToImage,
     "GPTImage2Edit_fal": GPTImage2Edit,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
@@ -3560,6 +3829,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance2ReferenceToVideo_fal": "Seedance 2.0 Reference-to-Video (fal)",
     "Seedance15ProTextToVideo_fal": "Seedance 1.5 Pro Text-to-Video (fal)",
     "Seedance15ProImageToVideo_fal": "Seedance 1.5 Pro Image-to-Video (fal)",
+    "Seedance25Video_fal": "Seedance 2.5 Video (fal)",
+    "Seedance25Reference_fal": "Seedance 2.5 Reference-to-Video (fal)",
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
