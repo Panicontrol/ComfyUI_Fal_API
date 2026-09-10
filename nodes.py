@@ -3789,6 +3789,207 @@ class Seedance25Reference:
         return _finish(url, "seedance25_ref") + (seed_out,)
 
 
+# ---------------------------------------------------------------------------
+# GPT Image 2.5 — Flare (быстрый, дефолтный) и Sunburst (точный, для финала)
+# ---------------------------------------------------------------------------
+
+# $ за изображение: пиксели -> тариф по уровню качества. Таблицы Flare и
+# Sunburst у fal совпадают, различаются модели скоростью и точностью правок.
+_GPT25_PRICES = [
+    (1024 * 768, {"low": 0.00402, "medium": 0.00903, "high": 0.03612,
+                  "xhigh": 0.06420, "max": 0.14445}),
+    (1024 * 1024, {"low": 0.00588, "medium": 0.01317, "high": 0.05268,
+                   "xhigh": 0.09366, "max": 0.21072}),
+    (1024 * 1536, {"low": 0.00474, "medium": 0.01029, "high": 0.04116,
+                   "xhigh": 0.07377, "max": 0.16464}),
+    (1920 * 1080, {"low": 0.00441, "medium": 0.01029, "high": 0.03960,
+                   "xhigh": 0.07041, "max": 0.15840}),
+    (2560 * 1440, {"low": 0.00615, "medium": 0.01434, "high": 0.05529,
+                   "xhigh": 0.09828, "max": 0.22110}),
+    (3840 * 2160, {"low": 0.01113, "medium": 0.02595, "high": 0.10008,
+                   "xhigh": 0.17790, "max": 0.40026}),
+]
+
+_GPT25_MODELS = ["flare (быстрее, для потока)", "sunburst (точнее, для финала)"]
+_GPT25_QUALITY = ["high", "auto", "low", "medium", "xhigh", "max"]
+_GPT25_BACKGROUND = ["auto", "transparent", "opaque"]
+_GPT25_FORMATS = ["png", "webp", "jpeg"]
+_GPT25_MAX_IMAGES = 16      # столько референсов принимает edit-эндпоинт
+_GPT25_MAX_EDGE = 3840      # и не больше 3840 px по стороне, кратно 16
+
+
+def _gpt25_tier(model):
+    return "sunburst" if model.startswith("sunburst") else "flare"
+
+
+def _gpt25_cost_text(args):
+    size = args.get("image_size", "auto")
+    if isinstance(size, dict):
+        px = size.get("width", 1024) * size.get("height", 1024)
+    else:
+        px = _GPT_PRESET_PX.get(size, 1024 * 1024)
+    prices = min(_GPT25_PRICES, key=lambda row: abs(row[0] - px))[1]
+    quality = args.get("quality", "high")
+    if quality == "auto":
+        quality = "high"
+    n = args.get("num_images", 1)
+    return (f"~${prices.get(quality, prices['high']) * n:.3f} "
+            f"({n} шт, {quality})")
+
+
+def _gpt25_image_size(image_size, custom_width, custom_height):
+    """Свой размер: кратно 16, не больше 3840 по стороне — иначе fal откажет."""
+    if custom_width <= 0 or custom_height <= 0:
+        return image_size
+    w, h = int(custom_width), int(custom_height)
+    fixed_w, fixed_h = (max(16, min(_GPT25_MAX_EDGE, (v // 16) * 16)) for v in (w, h))
+    if (fixed_w, fixed_h) != (w, h):
+        print(f"[fal gpt-image-2.5] размер {w}x{h} поправлен на "
+              f"{fixed_w}x{fixed_h}: сторона должна быть кратна 16 и не "
+              f"больше {_GPT25_MAX_EDGE} px")
+    return {"width": fixed_w, "height": fixed_h}
+
+
+def _download_images_rgba(urls):
+    """Как _download_images_as_tensor, но сохраняет альфу: возвращает
+    (IMAGE (B,H,W,3), MASK (B,H,W)). Маска — по конвенции ComfyUI, где
+    1 = прозрачно (как отдаёт Load Image)."""
+    import torch
+    pils = []
+    for u in urls:
+        try:
+            data = _download_bytes(u)
+        except Exception as e:
+            raise RuntimeError(
+                "Результат сгенерирован, но не скачался с CDN fal "
+                f"({type(e).__name__}). Файлы доступны по ссылкам (выход "
+                f"image_urls / открой в браузере):\n  " + "\n  ".join(urls)
+            ) from e
+        pils.append(Image.open(io.BytesIO(data)))
+    base = pils[0].size
+    rgbs, alphas = [], []
+    for p in pils:
+        if p.size != base:
+            p = p.resize(base, Image.LANCZOS)
+        rgba = p.convert("RGBA")
+        arr = np.asarray(rgba).astype(np.float32) / 255.0
+        rgbs.append(arr[..., :3])
+        alphas.append(1.0 - arr[..., 3])   # 1 = прозрачная область
+    return (torch.from_numpy(np.stack(rgbs)),
+            torch.from_numpy(np.stack(alphas)))
+
+
+def _run_gpt_image25(endpoint, args):
+    print(f"[fal {endpoint}] ориентировочная стоимость: {_gpt25_cost_text(args)}")
+    result = _run_request(endpoint, args, est_seconds=45 * args.get("num_images", 1))
+    urls = [img["url"] for img in (result or {}).get("images", []) if img.get("url")]
+    if not urls:
+        raise RuntimeError(f"fal не вернул изображения: {result}")
+    images, alpha = _download_images_rgba(urls)
+    return images, alpha, "\n".join(urls)
+
+
+class GPTImage25:
+    """GPT Image 2.5 — два варианта одной модели. **flare** быстрее (примерно
+    вдвое меньше задержка, чем у GPT Image 2) и подходит для потока и
+    прототипов; **sunburst** точнее держит контекст при правках и не трогает
+    те части кадра, которых не касается промпт — под финальную графику.
+    Тарифы у обоих одинаковые.
+
+    Без подключённых картинок работает как text-to-image, с картинками
+    (до 16 штук: сокеты image_1..image_4 плюс ссылки в extra_image_urls) —
+    как edit. Маска указывает область для изменения: белое = менять.
+
+    Новое по сравнению с GPT Image 2: уровни качества xhigh и max, прозрачный
+    фон (background = transparent) и выбор формата выхода. Альфа-канал
+    приходит отдельным выходом alpha (1 = прозрачно), как у Load Image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "model": (_GPT25_MODELS, {"default": _GPT25_MODELS[0]}),
+                "image_size": (GPT_IMAGE_SIZES, {"default": "landscape_4_3"}),
+                "quality": (_GPT25_QUALITY, {
+                    "default": "high",
+                    "tooltip": "xhigh и max заметно дороже: на 1024x1024 это "
+                               "$0.094 и $0.211 против $0.053 у high"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "mask": ("MASK", {"tooltip": "белое = область, которую менять"}),
+                "custom_width": ("INT", {"default": 0, "min": 0,
+                                         "max": _GPT25_MAX_EDGE, "step": 16}),
+                "custom_height": ("INT", {"default": 0, "min": 0,
+                                          "max": _GPT25_MAX_EDGE, "step": 16}),
+                "extra_image_urls": ("STRING", {"default": "", "tooltip":
+                                                "ссылки или пути, через запятую"}),
+                "background": (_GPT25_BACKGROUND, {
+                    "default": "auto",
+                    "tooltip": "transparent — прозрачный фон; работает только "
+                               "с png и webp"}),
+                "output_format": (_GPT25_FORMATS, {"default": "png"}),
+                "output_compression": ("INT", {
+                    "default": 0, "min": 0, "max": 100,
+                    "tooltip": "0 — не задавать. Только для jpeg и webp"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("images", "alpha", "image_urls")
+    FUNCTION = "generate"
+    CATEGORY = "fal/GPT Image"
+
+    def generate(self, prompt, model=_GPT25_MODELS[0],
+                 image_size="landscape_4_3", quality="high", num_images=1,
+                 image_1=None, image_2=None, image_3=None, image_4=None,
+                 mask=None, custom_width=0, custom_height=0,
+                 extra_image_urls="", background="auto",
+                 output_format="png", output_compression=0):
+        _require_deps()
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                urls += _upload_image_input(img, _GPT25_MAX_IMAGES - len(urls))
+        urls += _resolve_media_list(extra_image_urls, _GPT25_MAX_IMAGES - len(urls))
+
+        if background == "transparent" and output_format == "jpeg":
+            print("[fal gpt-image-2.5] jpeg не умеет прозрачность — "
+                  "переключаю формат выхода на png")
+            output_format = "png"
+
+        args = {
+            "prompt": prompt,
+            "image_size": _gpt25_image_size(image_size, custom_width, custom_height),
+            "quality": quality,
+            "num_images": num_images,
+            "output_format": output_format,
+        }
+        if background != "auto":
+            args["background"] = background
+        if output_compression > 0 and output_format in ("jpeg", "webp"):
+            args["output_compression"] = int(output_compression)
+
+        tier = _gpt25_tier(model)
+        if urls:  # есть референсы -> edit-эндпоинт
+            args["image_urls"] = urls
+            if mask is not None:
+                args["mask_url"] = _mask_to_url(mask)
+            endpoint = f"openai/gpt-image-2.5/{tier}/edit"
+        else:
+            if mask is not None:
+                raise RuntimeError(
+                    "Маска подключена, но нет ни одной картинки: для инпейнта "
+                    "подключи изображение в image_1.")
+            endpoint = f"openai/gpt-image-2.5/{tier}/text-to-image"
+        return _run_gpt_image25(endpoint, args)
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -3799,6 +4000,7 @@ NODE_CLASS_MAPPINGS = {
     "Seedance25Reference_fal": Seedance25Reference,
     "GPTImage2TextToImage_fal": GPTImage2TextToImage,
     "GPTImage2Edit_fal": GPTImage2Edit,
+    "GPTImage25_fal": GPTImage25,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
@@ -3833,6 +4035,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance25Reference_fal": "Seedance 2.5 Reference-to-Video (fal)",
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
+    "GPTImage25_fal": "GPT Image 2.5 Flare / Sunburst (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",

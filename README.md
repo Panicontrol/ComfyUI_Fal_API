@@ -20,6 +20,7 @@
 | MiniMax H3 Reference-to-Video (fal) | `minimax/h3/reference-to-video[/lora]` | До 9 картинок + 3 видео + 3 аудио как референсы |
 | MiniMax H3 Max Video (fal) | `minimax/h3-max[-turbo]/{text,image}-to-video` | Пост-тренированный fal вариант H3: точнее по промпту, быстрее реального времени, 480P/768P |
 | MiniMax H3 Max Reference-to-Video (fal) | `minimax/h3-max/reference-to-video` | Те же мультимодальные референсы на H3 Max |
+| GPT Image 2.5 Flare / Sunburst (fal) | `openai/gpt-image-2.5/{flare,sunburst}/{text-to-image,edit}` | Качество до max, прозрачный фон, до 16 референсов, выход alpha |
 
 Каждая нода возвращает три выхода: `video` (нативный тип VIDEO — подключается к Save Video / Preview Video), `video_url` (ссылка на mp4 на серверах fal) и `local_path` (файл уже скачан в папку output ComfyUI).
 

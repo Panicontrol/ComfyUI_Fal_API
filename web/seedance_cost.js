@@ -74,6 +74,28 @@ function seedanceCost(v, { v15 = false, durMax = 15 } = {}) {
   return `≈ ${fmt(perSec * parseInt(dur, 10))}`;
 }
 
+// GPT Image 2.5: пять уровней качества; таблицы Flare и Sunburst совпадают.
+const GPT25_PRICES = [
+  [1024 * 768,  { low: 0.00402, medium: 0.00903, high: 0.03612, xhigh: 0.06420, max: 0.14445 }],
+  [1024 * 1024, { low: 0.00588, medium: 0.01317, high: 0.05268, xhigh: 0.09366, max: 0.21072 }],
+  [1024 * 1536, { low: 0.00474, medium: 0.01029, high: 0.04116, xhigh: 0.07377, max: 0.16464 }],
+  [1920 * 1080, { low: 0.00441, medium: 0.01029, high: 0.03960, xhigh: 0.07041, max: 0.15840 }],
+  [2560 * 1440, { low: 0.00615, medium: 0.01434, high: 0.05529, xhigh: 0.09828, max: 0.22110 }],
+  [3840 * 2160, { low: 0.01113, medium: 0.02595, high: 0.10008, xhigh: 0.17790, max: 0.40026 }],
+];
+
+function gpt25Cost(v) {
+  const px = (v.custom_width > 0 && v.custom_height > 0)
+    ? v.custom_width * v.custom_height
+    : (GPT_PRESET_PX[v.image_size] || 1024 * 1024);
+  let best = GPT25_PRICES[0];
+  for (const row of GPT25_PRICES) {
+    if (Math.abs(row[0] - px) < Math.abs(best[0] - px)) best = row;
+  }
+  const q = v.quality === "auto" || !v.quality ? "high" : v.quality;
+  return `≈ ${fmt((best[1][q] ?? best[1].high) * (v.num_images || 1))}`;
+}
+
 function gptCost(v) {
   let px;
   if (v.custom_width > 0 && v.custom_height > 0) px = v.custom_width * v.custom_height;
@@ -136,6 +158,7 @@ const CALCS = {
   Seedance15ProImageToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   GPTImage2TextToImage_fal: gptCost,
   GPTImage2Edit_fal: gptCost,
+  GPTImage25_fal: gpt25Cost,
   NanoBananaEdit_fal: nanoBananaCost,
   QwenImageMax_fal: (v) => `≈ ${fmt(0.075 * (v.num_images || 1))}`,
   IdeogramImage_fal: (v) => {
