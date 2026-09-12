@@ -3990,6 +3990,185 @@ class GPTImage25:
         return _run_gpt_image25(endpoint, args)
 
 
+# ---------------------------------------------------------------------------
+# Апскейл и реставрация на FLUX: Flux Vision Upscaler и LucidFlux
+# ---------------------------------------------------------------------------
+
+_FLUX_UPS_RATE_MP = 0.1   # $ за мегапиксель результата у flux-vision-upscaler
+
+
+def _image_wh(image_tensor):
+    """(ширина, высота) первого кадра IMAGE-батча (B,H,W,C)."""
+    try:
+        return int(image_tensor.shape[2]), int(image_tensor.shape[1])
+    except Exception:
+        return 0, 0
+
+
+def _download_single_image(url):
+    """Один URL -> IMAGE-батч (1,H,W,3)."""
+    return _download_images_as_tensor([url])
+
+
+class FluxVisionUpscale:
+    """Flux Vision Upscaler — увеличение до 4x. Модель сначала сама описывает
+    картинку зрительно-языковой моделью, а потом ведёт апскейл по этому
+    описанию, поэтому детали дорисовываются осмысленно, а не просто резче.
+    Полученную подпись нода отдаёт выходом caption.
+
+    `creativity` — это сила денойза: на 0.1–0.2 результат почти не отходит от
+    оригинала, на 0.5 и выше модель начинает додумывать фактуру и мелочи.
+    Цена: $0.1 за мегапиксель результата, то есть увеличение картинки
+    1024x1024 вдвое даёт 4.2 МП и стоит примерно $0.42 — коэффициент входит
+    в цену квадратом, это стоит помнить."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "upscale_factor": ("FLOAT", {
+                    "default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "цена растёт как квадрат коэффициента"}),
+                "creativity": ("FLOAT", {
+                    "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "сила денойза: больше — больше отсебятины"}),
+                "guidance": ("FLOAT", {
+                    "default": 1.0, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "насколько жёстко держаться подписи от VLM"}),
+                "steps": ("INT", {"default": 20, "min": 4, "max": 50}),
+            },
+            "optional": {
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT")
+    RETURN_NAMES = ("image", "caption", "image_url", "seed")
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, image, upscale_factor=2.0, creativity=0.3, guidance=1.0,
+                steps=20, seed=-1, enable_safety_checker=True):
+        _require_deps()
+        w, h = _image_wh(image)
+        args = {
+            "image_url": _upload_image_input(image, 1)[0],
+            "upscale_factor": float(upscale_factor),
+            "creativity": float(creativity),
+            "guidance": float(guidance),
+            "steps": int(steps),
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        _seed_arg(args, seed)
+
+        endpoint = "fal-ai/flux-vision-upscaler"
+        if w and h:
+            out_mp = (w * upscale_factor) * (h * upscale_factor) / 1e6
+            print(f"[fal {endpoint}] {w}x{h} -> "
+                  f"{int(w * upscale_factor)}x{int(h * upscale_factor)} "
+                  f"({out_mp:.2f} МП), ориентировочная стоимость "
+                  f"~${_FLUX_UPS_RATE_MP * out_mp:.2f}")
+        else:
+            print(f"[fal {endpoint}] не удалось прочитать размер входа, "
+                  f"тариф $%.2f за МП результата" % _FLUX_UPS_RATE_MP)
+
+        result = _run_request(endpoint, args, est_seconds=30 + steps * 2)
+        img = (result or {}).get("image") or {}
+        url = img.get("url")
+        if not url:
+            raise RuntimeError(f"fal не вернул изображение: {result}")
+        caption = (result or {}).get("caption") or ""
+        if caption:
+            print(f"[fal {endpoint}] подпись от VLM: {caption[:300]}"
+                  f"{'…' if len(caption) > 300 else ''}")
+        seed_out = (result or {}).get("seed")
+        if img.get("width"):
+            print(f"[fal {endpoint}] готово: {img['width']}x{img.get('height')}")
+        return (_download_single_image(url), caption, url,
+                int(seed_out) if seed_out is not None else -1)
+
+
+class LucidFluxRestore:
+    """LucidFlux — реставрация битых и мыльных кадров на большом диффузионном
+    трансформере семейства FLUX (статья ICLR 2026). В отличие от обычного
+    апскейлера тянет не только разрешение: убирает компрессионные артефакты,
+    шум и расфокус, дорисовывая правдоподобную фактуру.
+
+    Размер результата задаётся напрямую. Если target_width и target_height
+    оставить нулями, нода посчитает их сама как размер входа, умноженный на
+    upscale_factor. Тариф fal на эту модель не опубликован — оценки в логе
+    не будет, проверяй расход в дашборде."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "high-quality, clean, sharp, high-resolution photo",
+                    "tooltip": "куда вести реставрацию; модель обучена работать "
+                               "и без детального описания"}),
+                "upscale_factor": ("FLOAT", {
+                    "default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "используется, только если target_* равны нулю"}),
+                "num_inference_steps": ("INT", {"default": 50, "min": 4, "max": 100}),
+                "guidance": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 10.0,
+                                       "step": 0.1}),
+            },
+            "optional": {
+                "target_width": ("INT", {"default": 0, "min": 0, "max": 4096,
+                                         "step": 16,
+                                         "tooltip": "0 — считать из входа"}),
+                "target_height": ("INT", {"default": 0, "min": 0, "max": 4096,
+                                          "step": 16}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "image_url")
+    FUNCTION = "restore"
+    CATEGORY = "fal/Upscale"
+
+    def restore(self, image, prompt, upscale_factor=2.0,
+                num_inference_steps=50, guidance=4.0,
+                target_width=0, target_height=0, seed=-1):
+        _require_deps()
+        w, h = _image_wh(image)
+        if target_width > 0 and target_height > 0:
+            tw, th = int(target_width), int(target_height)
+        elif w and h:
+            tw, th = int(w * upscale_factor), int(h * upscale_factor)
+        else:
+            tw = th = 1024
+            print("[fal lucidflux] размер входа не прочитался — беру 1024x1024")
+
+        args = {
+            "image_url": _upload_image_input(image, 1)[0],
+            "prompt": prompt,
+            "target_width": tw,
+            "target_height": th,
+            "num_inference_steps": int(num_inference_steps),
+            "guidance": float(guidance),
+        }
+        _seed_arg(args, seed)
+
+        endpoint = "fal-ai/lucidflux"
+        print(f"[fal {endpoint}] {w}x{h} -> {tw}x{th}, шагов "
+              f"{num_inference_steps}. Тариф fal на эту модель не опубликован — "
+              f"оценку стоимости не показываю")
+        result = _run_request(endpoint, args,
+                              est_seconds=30 + num_inference_steps * 2)
+        img = (result or {}).get("image") or {}
+        url = img.get("url")
+        if not url:
+            raise RuntimeError(f"fal не вернул изображение: {result}")
+        return _download_single_image(url), url
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -4002,6 +4181,8 @@ NODE_CLASS_MAPPINGS = {
     "GPTImage2Edit_fal": GPTImage2Edit,
     "GPTImage25_fal": GPTImage25,
     "TopazVideoUpscale_fal": TopazVideoUpscale,
+    "FluxVisionUpscale_fal": FluxVisionUpscale,
+    "LucidFluxRestore_fal": LucidFluxRestore,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
     "SAM2Video_fal": SAM2Video,
@@ -4037,6 +4218,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "GPTImage25_fal": "GPT Image 2.5 Flare / Sunburst (fal)",
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
+    "FluxVisionUpscale_fal": "FLUX Vision Upscaler (fal)",
+    "LucidFluxRestore_fal": "LucidFlux Restore / Upscale (fal)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",
