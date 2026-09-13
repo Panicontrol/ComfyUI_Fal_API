@@ -4169,6 +4169,118 @@ class LucidFluxRestore:
         return _download_single_image(url), url
 
 
+# ---------------------------------------------------------------------------
+# FLUX Video Upscale (Black Forest Labs) — апскейл видео на FLUX 3
+# ---------------------------------------------------------------------------
+
+_FVU_MODES = ["precise (точно по исходнику)", "creative (дорисовка деталей)"]
+
+# $ за секунду выданного видео: режим -> тир разрешения
+_FVU_RATE = {
+    "precise": {"1080p": 0.14, "2K": 0.25, "4K": 0.55},
+    "creative": {"1080p": 0.20, "2K": 0.35, "4K": 0.79},
+}
+_FVU_MAX_INPUT_SEC = 20.0   # документированный лимит входа
+
+
+def _fvu_tier(w, h):
+    """Тир тарификации по длинной стороне результата."""
+    edge = max(int(w or 0), int(h or 0))
+    if edge <= 1920:
+        return "1080p"
+    if edge <= 2560:
+        return "2K"
+    return "4K"
+
+
+class FluxVideoUpscale:
+    """FLUX Video Upscale от Black Forest Labs — супер-разрешение видео на
+    FLUX 3. Это НЕ тот же апскейлер, что FLUX Vision Upscaler: тот работает
+    с картинками, этот с роликами, и живёт в пространстве blackforestlabs/.
+
+    Два режима. **precise** увеличивает строго по исходнику и ничего не
+    придумывает — то, что нужно плейтам и монтажу. **creative** дорисовывает
+    фактуру и мелкие детали, и только в нём имеет смысл `prompt`: им можно
+    направить дорисовку. Здесь по умолчанию стоит precise (у самого fal
+    дефолт creative) — он дешевле и не меняет материал.
+
+    Цена считается за секунду ВЫДАННОГО видео по тиру разрешения:
+    precise — $0.14 / $0.25 / $0.55 за секунду (1080p / 2K / 4K),
+    creative — $0.20 / $0.35 / $0.79. Вход не длиннее 20 секунд."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "upscale_factor": ("FLOAT", {
+                    "default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "пропорции исходника сохраняются"}),
+                "mode": (_FVU_MODES, {"default": _FVU_MODES[0]}),
+            },
+            "optional": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "работает только в режиме creative — чем вести "
+                               "дорисовку деталей"}),
+                "safety_tolerance": ("INT", {
+                    "default": 2, "min": 0, "max": 6,
+                    "tooltip": "меньше — строже фильтр контента"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, video, upscale_factor=2.0, mode=_FVU_MODES[0],
+                prompt="", safety_tolerance=2):
+        _require_deps()
+        url_in, dur, w, h = _upload_video_input(video, label="видео для апскейла",
+                                                min_duration=None)
+        if dur is not None and dur > _FVU_MAX_INPUT_SEC:
+            raise RuntimeError(
+                f"На входе {dur:.1f} с, а FLUX Video Upscale принимает не "
+                f"больше {_FVU_MAX_INPUT_SEC:.0f} с (и 50 МБ). Нарежь ролик "
+                f"на куски и склей после апскейла.")
+
+        creative = mode.startswith("creative")
+        args = {
+            "video_url": url_in,
+            "upscale_factor": float(upscale_factor),
+            "creativity": 1 if creative else 0,
+            "safety_tolerance": int(safety_tolerance),
+        }
+        if prompt.strip():
+            if creative:
+                args["prompt"] = prompt
+            else:
+                print("[fal flux-video-upscale] prompt игнорируется в режиме "
+                      "precise — он влияет только на creative")
+
+        endpoint = "blackforestlabs/flux-video-upscale"
+        if w and h:
+            ow, oh = int(w * upscale_factor), int(h * upscale_factor)
+            tier = _fvu_tier(ow, oh)
+            rate = _FVU_RATE["creative" if creative else "precise"][tier]
+            cost = (f"~${rate * dur:.2f}" if dur else
+                    f"${rate:.2f} за секунду результата")
+            print(f"[fal {endpoint}] {w}x{h} -> {ow}x{oh} (тир {tier}), "
+                  f"режим {'creative' if creative else 'precise'}"
+                  + (f", {dur:.1f} с" if dur else "")
+                  + f", ориентировочная стоимость {cost}")
+        else:
+            print(f"[fal {endpoint}] размер входа не прочитался — "
+                  f"оценку стоимости не показываю")
+
+        result = _run_request(endpoint, args, est_seconds=60 + (dur or 5) * 30)
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(out["url"], "flux_video_upscale")
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -4183,6 +4295,7 @@ NODE_CLASS_MAPPINGS = {
     "TopazVideoUpscale_fal": TopazVideoUpscale,
     "FluxVisionUpscale_fal": FluxVisionUpscale,
     "LucidFluxRestore_fal": LucidFluxRestore,
+    "FluxVideoUpscale_fal": FluxVideoUpscale,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
     "SAM2Video_fal": SAM2Video,
@@ -4220,6 +4333,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
     "FluxVisionUpscale_fal": "FLUX Vision Upscaler (fal)",
     "LucidFluxRestore_fal": "LucidFlux Restore / Upscale (fal)",
+    "FluxVideoUpscale_fal": "FLUX Video Upscale (fal)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",

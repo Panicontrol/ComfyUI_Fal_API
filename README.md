@@ -23,6 +23,7 @@
 | GPT Image 2.5 Flare / Sunburst (fal) | `openai/gpt-image-2.5/{flare,sunburst}/{text-to-image,edit}` | Качество до max, прозрачный фон, до 16 референсов, выход alpha |
 | FLUX Vision Upscaler (fal) | `fal-ai/flux-vision-upscaler` | Апскейл до 4x по подписи от VLM, выход caption; $0.1/МП результата |
 | LucidFlux Restore / Upscale (fal) | `fal-ai/lucidflux` | Реставрация битых кадров на FLUX-трансформере, размер выхода задаётся явно |
+| FLUX Video Upscale (fal) | `blackforestlabs/flux-video-upscale` | Апскейл видео на FLUX 3, режимы precise / creative; вход до 20 с |
 
 Каждая нода возвращает три выхода: `video` (нативный тип VIDEO — подключается к Save Video / Preview Video), `video_url` (ссылка на mp4 на серверах fal) и `local_path` (файл уже скачан в папку output ComfyUI).
 
