@@ -123,6 +123,24 @@ def _upload_image_input(image_tensor, limit=1):
     return urls
 
 
+def _probe_codec_info(path):
+    """(кодек, профиль, pix_fmt) первого видеопотока или None — чтобы видеть,
+    что реально пришло от провайдера (например, доехали ли 10/12 бит)."""
+    try:
+        import av
+        with av.open(path) as c:
+            cc = c.streams.video[0].codec_context
+            return cc.name, (cc.profile or None), cc.pix_fmt
+    except Exception:
+        return None
+
+
+def _bits_from_pix_fmt(pix_fmt):
+    """yuv444p12le -> 12, yuv420p10le -> 10, yuv420p -> 8."""
+    m = re.search(r"p(\d{2})(?:le|be)$", pix_fmt or "")
+    return int(m.group(1)) if m else 8
+
+
 def _probe_video_info(path):
     """(длительность_с, ширина, высота) по метаданным контейнера — так видео
     увидит fal. Любое поле может быть None."""
@@ -4653,7 +4671,24 @@ class BytedanceVideoUpscale:
         out = (result or {}).get("video") or {}
         if not out.get("url"):
             raise RuntimeError(f"fal не вернул видео: {result}")
-        return _finish(out["url"], "bytedance_upscale")
+        res = _finish(out["url"], "bytedance_upscale")
+        info = _probe_codec_info(res[2])
+        if info:
+            codec, profile, pix_fmt = info
+            got = _bits_from_pix_fmt(pix_fmt)
+            print(f"[fal {endpoint}] результат: {codec}"
+                  + (f" {profile}" if profile else "")
+                  + f", {pix_fmt} ({got} бит)")
+            if got < int(bit_depth):
+                print(f"[fal] ВНИМАНИЕ: запрошено {bit_depth} бит, а пришло {got}")
+            if got > 8:
+                print(f"[fal] мастер в {got} бит: {res[2]}\n"
+                      f"      выход video внутри графа ComfyUI — 8-битный, для "
+                      f"грейдинга бери файл по local_path. Многие плееры и "
+                      f"монтажки такой HEVC не открывают — надёжнее перегнать в "
+                      f"16-битный TIFF-сиквенс:\n"
+                      f"      ffmpeg -i \"{res[2]}\" -pix_fmt rgb48le кадр_%05d.tif")
+        return res
 
 
 NODE_CLASS_MAPPINGS = {
