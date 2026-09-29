@@ -4619,7 +4619,7 @@ class BytedanceVideoUpscale:
             "enhancement_preset": enhancement_preset,
             "enhancement_tier": enhancement_tier,
             "fidelity": fidelity,
-            "bit_depth": bit_depth,
+            "bit_depth": int(bit_depth),     # API ждёт число, не строку
         }
         if scale_ratio and scale_ratio >= 1.1:
             args["scale_ratio"] = float(scale_ratio)
