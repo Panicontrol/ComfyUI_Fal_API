@@ -259,13 +259,30 @@ def _reencode_video(src_path):
     )
 
 
+def _probe_video_fps(path):
+    """Частота кадров видеопотока (float, например 23.976) или None."""
+    try:
+        import av
+        with av.open(path) as c:
+            v = c.streams.video[0]
+            rate = v.average_rate or v.guessed_rate or v.base_rate
+            return float(rate) if rate else None
+    except Exception:
+        return None
+
+
 def _upload_video_input(video, label="видео", min_duration=2.0):
-    """VIDEO-вход ComfyUI -> URL в fal storage.
+    """VIDEO-вход ComfyUI -> URL в fal storage. Возвращает (url, dur, w, h)."""
+    return _upload_video_input_ex(video, label, min_duration)[:4]
+
+
+def _upload_video_input_ex(video, label="видео", min_duration=2.0):
+    """То же, что _upload_video_input, плюс частота кадров исходника.
 
     Здоровые файлы грузятся как есть; если метаданные контейнера битые
-    (Unreal/NLE) — видео перекодируется. Возвращает (url, dur, w, h)."""
+    (Unreal/NLE) — видео перекодируется. Возвращает (url, dur, w, h, fps)."""
     if isinstance(video, str) and video.lower().startswith(("http://", "https://")):
-        return video, None, None, None
+        return video, None, None, None, None
 
     # получаем локальный файл-источник
     src, tmp_src = None, None
@@ -307,7 +324,8 @@ def _upload_video_input(video, label="видео", min_duration=2.0):
                 f"(fal требует 2–15 с суммарно). Похоже, в видео-вход "
                 f"попал одиночный кадр — подключи полноценный ролик."
             )
-        return fal_client.upload_file(src), dur, w, h
+        fps = _probe_video_fps(src)
+        return fal_client.upload_file(src), dur, w, h, fps
     finally:
         for p in (tmp_src, tmp_enc):
             if p:
@@ -4598,7 +4616,8 @@ class BytedanceVideoUpscale:
             "optional": {
                 "target_fps": ("INT", {
                     "default": 0, "min": 0, "max": 120,
-                    "tooltip": "0 — оставить как в исходнике. Выше 30 fps "
+                    "tooltip": "0 — взять частоту исходника (сам fal без этого "
+                               "ставит 30 и дорисовывает кадры). Выше 30 fps "
                                "тариф удваивается"}),
                 "fidelity": (["high", "medium"], {"default": "high"}),
                 "bit_depth": (_BD_BITS, {
@@ -4630,8 +4649,8 @@ class BytedanceVideoUpscale:
                 f"scale_ratio принимает значения от 1.1 до 10, а задано "
                 f"{scale_ratio}. Поставь 0, чтобы использовать target_resolution.")
 
-        url, dur, w, h = _upload_video_input(video, label="видео для апскейла",
-                                             min_duration=None)
+        url, dur, w, h, src_fps = _upload_video_input_ex(
+            video, label="видео для апскейла", min_duration=None)
         args = {
             "video_url": url,
             "enhancement_preset": enhancement_preset,
@@ -4645,8 +4664,21 @@ class BytedanceVideoUpscale:
                 print("[fal] scale_ratio ограничен 4K — fal понизит коэффициент")
         else:
             args["target_resolution"] = target_resolution
+        # У этого эндпоинта target_fps по умолчанию 30: без явного значения
+        # 24-кадровый исходник вернётся в 30 кадрах с дорисованными кадрами.
         if target_fps and target_fps > 0:
-            args["target_fps"] = float(target_fps)
+            out_fps = float(target_fps)
+        elif src_fps:
+            out_fps = round(src_fps, 3)          # 23.976 остаётся 23.976
+            print(f"[fal] частота исходника {out_fps:g} fps — отправляю её явно, "
+                  f"иначе fal пересчитает ролик в 30 fps")
+        else:
+            out_fps = None
+            print("[fal] ВНИМАНИЕ: частоту исходника прочитать не удалось, а без "
+                  "неё fal отдаст 30 fps. Задай target_fps вручную, если исходник "
+                  "в другой частоте")
+        if out_fps:
+            args["target_fps"] = out_fps
 
         endpoint = "fal-ai/bytedance-upscaler/upscale/video"
         rate = _BD_RATE.get(target_resolution)
@@ -4655,8 +4687,7 @@ class BytedanceVideoUpscale:
         if rate and dur:
             if enhancement_tier == "pro":
                 rate *= 10
-            fps = target_fps if target_fps and target_fps > 0 else 30
-            rate *= max(1.0, fps / 30.0)
+            rate *= max(1.0, (out_fps or 30) / 30.0)
             cost = f"~${rate * dur:.3f}"
         elif target_resolution in ("6k", "8k"):
             cost = "тариф fal для 6K и 8K не опубликован"
@@ -4664,6 +4695,7 @@ class BytedanceVideoUpscale:
             cost = "оценка недоступна"
         print(f"[fal {endpoint}] {target_resolution}, пресет "
               f"{enhancement_preset}, тир {enhancement_tier}, {bit_depth} бит"
+              + (f", {out_fps:g} fps" if out_fps else "")
               + (f", {dur:.1f} с" if dur else "")
               + f", ориентировочная стоимость: {cost}")
 
