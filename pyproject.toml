@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-fal-api"
+description = "Ноды ComfyUI для fal.ai: Seedance, LTX-2.3, MiniMax H3, Kling, Wan, FLUX, GPT Image, Qwen, Seedream, Ideogram, апскейл, сегментация и обучение LoRA."
+version = "1.0.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["fal-client", "requests", "pillow"]
+
+[project.urls]
+Repository = "https://github.com/Panicontrol/ComfyUI_Fal_API"
+
+[tool.comfy]
+PublisherId = "panicontrol"
+DisplayName = "ComfyUI Fal API"
+Repository = "https://github.com/Panicontrol/ComfyUI_Fal_API"
