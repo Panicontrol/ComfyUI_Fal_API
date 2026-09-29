@@ -4281,6 +4281,381 @@ class FluxVideoUpscale:
         return _finish(out["url"], "flux_video_upscale")
 
 
+# ---------------------------------------------------------------------------
+# Topaz: новые раздельные эндпоинты (precision / generative / creative)
+# и ByteDance Video Upscaler
+# ---------------------------------------------------------------------------
+
+# Все тарифы Topaz ниже — $ за секунду результата при 30 fps; на 60 fps цена
+# удваивается. Тир определяется по высоте выходного кадра.
+_TOPAZ_PRECISION_MODELS = [
+    "Proteus", "Proteus Natural", "Iris", "Iris Low Quality",
+    "Dione DV", "Dione TV", "Dione Robust", "Dione Dehalo", "Dione Robust Dehalo",
+    "Artemis High Quality", "Artemis Medium Quality", "Artemis Low Quality",
+    "Artemis Strong Halo", "Artemis Medium Halo", "Artemis Aliasing & Moire",
+    "Gaia HQ", "Gaia CG", "Gaia 2", "Rhea",
+    "Theia Fine Tune Detail", "Theia Fine Tune Fidelity",
+]
+_TOPAZ_GENERATIVE_MODELS = ["Starlight Precise 2.6", "Starlight HQ",
+                            "Starlight Mini", "Starlight Sharp", "Starlight Fast 2"]
+
+_TOPAZ_PRECISION_RATE = {"720p": 0.010, "1080p": 0.020, "4K": 0.060}
+_TOPAZ_PRECISION_EXC = {                       # модели со своим прайсом
+    "Proteus Natural": {"720p": 0.010, "1080p": 0.020, "4K": 0.050},
+    "Gaia 2":          {"720p": 0.010, "1080p": 0.010, "4K": 0.030},
+}
+_TOPAZ_GENERATIVE_RATE = {"720p": 0.120, "1080p": 0.120, "4K": 0.260}
+_TOPAZ_CREATIVE_RATE = {"720p": 0.300, "1080p": 0.300, "4K": 0.500}
+
+_TOPAZ_FPS_INPUT = ("INT", {
+    "default": 0, "min": 0, "max": 120,
+    "tooltip": "0 — не интерполировать. Выше 30 fps тариф удваивается"})
+_TOPAZ_FACTOR_INPUT = ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.25})
+_TOPAZ_H264_INPUT = ("BOOLEAN", {
+    "default": True,
+    "tooltip": "H264 совместимее (превью в браузере); false = H265, меньше размер"})
+_TOPAZ_MAX_INPUT_SEC = 300.0   # у всех трёх эндпоинтов вход ограничен 5 минутами
+
+
+def _topaz_tier(height):
+    if not height:
+        return None
+    if height <= 720:
+        return "720p"
+    if height <= 1080:
+        return "1080p"
+    return "4K"
+
+
+def _topaz_cost2(rates, w, h, factor, dur, target_fps, model=None, exc=None):
+    """Строка оценки для новых эндпоинтов Topaz."""
+    if not (w and h and dur):
+        return "оценка недоступна (не удалось прочитать метаданные видео)"
+    out_h = int(h * factor)
+    tier = _topaz_tier(out_h)
+    table = (exc or {}).get(model) or rates
+    per_sec = table[tier]
+    if model == "Starlight Fast 2":
+        per_sec /= 2.0                      # fal: Fast 2 стоит вдвое дешевле
+    fps = target_fps if target_fps and target_fps > 0 else 30
+    mult = max(1.0, fps / 30.0)             # «на 60 fps цена удваивается»
+    total = per_sec * dur * mult
+    note = f", {fps} fps" if mult != 1.0 else ""
+    return (f"~${total:.2f} ({int(w * factor)}x{out_h}, тир {tier}, "
+            f"{dur:.1f} с{note})")
+
+
+def _topaz_prepare(video, upscale_factor):
+    url, dur, w, h = _upload_video_input(video, label="видео для апскейла",
+                                         min_duration=None)
+    if dur is not None and dur > _TOPAZ_MAX_INPUT_SEC:
+        raise RuntimeError(
+            f"На входе {dur / 60:.1f} мин, а Topaz принимает ролики не длиннее "
+            f"5 минут. Нарежь на куски и склей после апскейла.")
+    return url, dur, w, h
+
+
+def _topaz_run(endpoint, args, dur, prefix):
+    result = _run_request(endpoint, args, est_seconds=60 + (dur or 10) * 15)
+    out = (result or {}).get("video") or {}
+    if not out.get("url"):
+        raise RuntimeError(f"fal не вернул видео: {result}")
+    return _finish(out["url"], prefix)
+
+
+class TopazVideoPrecision:
+    """Topaz Precision — честный апскейл без придумывания деталей: Proteus,
+    Iris, Dione, Artemis, Gaia, Rhea, Theia (21 модель). То, что нужно плейтам
+    и архивной съёмке, когда дорисовка недопустима.
+
+    Тонкие настройки (-1 = дефолт выбранной модели): compression убирает
+    артефакты сжатия, noise — шум, halo — ореолы по контрастным краям,
+    recover_detail возвращает мелкую фактуру, grain добавляет зерно.
+    Цена: $0.01 / $0.02 / $0.06 за секунду (720p / 1080p / 4K) при 30 fps."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "model": (_TOPAZ_PRECISION_MODELS, {"default": "Proteus"}),
+                "upscale_factor": _TOPAZ_FACTOR_INPUT,
+                "H264_output": _TOPAZ_H264_INPUT,
+            },
+            "optional": {
+                "target_fps": _TOPAZ_FPS_INPUT,
+                "compression": _TOPAZ_TUNE,
+                "noise": _TOPAZ_TUNE,
+                "halo": _TOPAZ_TUNE,
+                "grain": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.1,
+                                    "step": 0.01, "tooltip": "-1 = дефолт модели"}),
+                "recover_detail": _TOPAZ_TUNE,
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, video, model="Proteus", upscale_factor=2.0,
+                H264_output=True, target_fps=0, compression=-1.0, noise=-1.0,
+                halo=-1.0, grain=-1.0, recover_detail=-1.0):
+        _require_deps()
+        url, dur, w, h = _topaz_prepare(video, upscale_factor)
+        endpoint = "topaz/upscale/video/precision"
+        print(f"[fal {endpoint}] {model}, ориентировочная стоимость: "
+              + _topaz_cost2(_TOPAZ_PRECISION_RATE, w, h, upscale_factor, dur,
+                             target_fps, model, _TOPAZ_PRECISION_EXC))
+        args = {"video_url": url, "model": model,
+                "upscale_factor": float(upscale_factor),
+                "H264_output": bool(H264_output)}
+        if target_fps and target_fps > 0:
+            args["target_fps"] = int(target_fps)
+        for name, val in (("compression", compression), ("noise", noise),
+                          ("halo", halo), ("grain", grain),
+                          ("recover_detail", recover_detail)):
+            if val is not None and val >= 0:
+                args[name] = float(val)
+        return _topaz_run(endpoint, args, dur, "topaz_precision")
+
+
+class TopazVideoGenerative:
+    """Topaz Generative — семейство Starlight: диффузионный проход, который
+    восстанавливает правдоподобную фактуру там, где её в исходнике уже нет.
+    Хорошо ложится на сгенерированное видео и на сильно пожатый материал.
+
+    Starlight Fast 2 стоит вдвое дешевле остальных. Параметр softness
+    (1 — резче, 5 — мягче) работает только у Starlight Precise 2.6.
+    Цена: $0.12 за секунду до 1080p и $0.26 на 4K при 30 fps."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "model": (_TOPAZ_GENERATIVE_MODELS,
+                          {"default": "Starlight Precise 2.6"}),
+                "upscale_factor": _TOPAZ_FACTOR_INPUT,
+                "H264_output": _TOPAZ_H264_INPUT,
+            },
+            "optional": {
+                "target_fps": _TOPAZ_FPS_INPUT,
+                "softness": ("INT", {
+                    "default": 0, "min": 0, "max": 5,
+                    "tooltip": "0 — дефолт Topaz. 1 резче, 5 мягче; "
+                               "только для Starlight Precise 2.6"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, video, model="Starlight Precise 2.6", upscale_factor=2.0,
+                H264_output=True, target_fps=0, softness=0):
+        _require_deps()
+        url, dur, w, h = _topaz_prepare(video, upscale_factor)
+        endpoint = "topaz/upscale/video/generative"
+        print(f"[fal {endpoint}] {model}, ориентировочная стоимость: "
+              + _topaz_cost2(_TOPAZ_GENERATIVE_RATE, w, h, upscale_factor, dur,
+                             target_fps, model))
+        args = {"video_url": url, "model": model,
+                "upscale_factor": float(upscale_factor),
+                "H264_output": bool(H264_output)}
+        if target_fps and target_fps > 0:
+            args["target_fps"] = int(target_fps)
+        if softness and softness > 0:
+            if model != "Starlight Precise 2.6":
+                print("[fal] softness поддерживает только Starlight Precise 2.6 "
+                      "— параметр не отправляю")
+            else:
+                args["softness"] = float(softness)
+        return _topaz_run(endpoint, args, dur, "topaz_generative")
+
+
+class TopazVideoCreative:
+    """Topaz Creative (Astra 2) — самый «дорисовывающий» тир: изобретает
+    детали, которых в исходнике не было, и может идти по текстовому промпту.
+    Модель часто сама уводит результат в свои нативные разрешения, обычно 4K,
+    даже если запросить другой коэффициент.
+
+    Промпт ограничен роликами до 450 кадров. creativity управляет объёмом
+    выдумки, realism смещает её в сторону фотореализма, sharp — резкость.
+    Цена кусается: $0.30 за секунду до 1080p и $0.50 на 4K при 30 fps."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "upscale_factor": _TOPAZ_FACTOR_INPUT,
+                "H264_output": _TOPAZ_H264_INPUT,
+            },
+            "optional": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "чем вести дорисовку; работает на роликах "
+                               "не длиннее 450 кадров"}),
+                "creativity": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0,
+                                         "step": 0.05,
+                                         "tooltip": "-1 = дефолт (0.5)"}),
+                "realism": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0,
+                                      "step": 0.05, "tooltip": "-1 = не задавать"}),
+                "sharp": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0,
+                                    "step": 0.05, "tooltip": "-1 = дефолт (0.5)"}),
+                "target_fps": _TOPAZ_FPS_INPUT,
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, video, upscale_factor=2.0, H264_output=True, prompt="",
+                creativity=-1.0, realism=-1.0, sharp=-1.0, target_fps=0):
+        _require_deps()
+        url, dur, w, h = _topaz_prepare(video, upscale_factor)
+        endpoint = "topaz/upscale/video/creative"
+        print(f"[fal {endpoint}] Astra 2, ориентировочная стоимость: "
+              + _topaz_cost2(_TOPAZ_CREATIVE_RATE, w, h, upscale_factor, dur,
+                             target_fps))
+        args = {"video_url": url, "upscale_factor": float(upscale_factor),
+                "H264_output": bool(H264_output)}
+        if prompt.strip():
+            args["prompt"] = prompt
+            fps = target_fps if target_fps and target_fps > 0 else 30
+            if dur and dur * fps > 450:
+                print(f"[fal] промпт у Astra 2 работает на роликах до 450 кадров, "
+                      f"а здесь примерно {int(dur * fps)} — fal может его "
+                      f"проигнорировать или отклонить запрос")
+        if target_fps and target_fps > 0:
+            args["target_fps"] = int(target_fps)
+        for name, val in (("creativity", creativity), ("realism", realism),
+                          ("sharp", sharp)):
+            if val is not None and val >= 0:
+                args[name] = float(val)
+        return _topaz_run(endpoint, args, dur, "topaz_creative")
+
+
+# --- ByteDance Video Upscaler -------------------------------------------------
+
+_BD_RES = ["1080p", "2k", "4k", "6k", "8k"]
+_BD_PRESETS = ["general", "ugc", "short_series", "aigc", "old_film"]
+_BD_TIERS = ["standard", "fast", "pro"]
+_BD_BITS = ["8", "10", "12"]
+# $ за секунду результата при 30 fps, тир standard; pro дороже в 10 раз,
+# 60 fps удваивает. Для 6k/8k fal тариф не публикует.
+_BD_RATE = {"1080p": 0.0072, "2k": 0.0144, "4k": 0.0288}
+
+
+class BytedanceVideoUpscale:
+    """ByteDance Video Upscaler — апскейл до 8K с пресетами под тип материала
+    и выводом в 10 или 12 бит. Единственный в паке, кто даёт больше восьми бит
+    на выходе: для грейдинга запас принципиально другой (динамический диапазон
+    это не расширяет — HDR из SDR по-прежнему не делается).
+
+    Пресеты: `aigc` под сгенерированное видео, `old_film` под реставрацию,
+    `ugc` и `short_series` под короткий формат, `general` universal.
+    Тир `pro` нужен для 10 и 12 бит и стоит вдесятеро дороже.
+    Цена standard при 30 fps: $0.0072 / $0.0144 / $0.0288 за секунду
+    (1080p / 2K / 4K) — на порядок дешевле FLUX Video Upscale."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "target_resolution": (_BD_RES, {"default": "1080p"}),
+                "enhancement_preset": (_BD_PRESETS, {
+                    "default": "general",
+                    "tooltip": "aigc — для сгенерированного видео, "
+                               "old_film — для реставрации плёнки"}),
+                "enhancement_tier": (_BD_TIERS, {
+                    "default": "standard",
+                    "tooltip": "pro дороже в 10 раз и обязателен для 10/12 бит"}),
+            },
+            "optional": {
+                "target_fps": ("INT", {
+                    "default": 0, "min": 0, "max": 120,
+                    "tooltip": "0 — оставить как в исходнике. Выше 30 fps "
+                               "тариф удваивается"}),
+                "fidelity": (["high", "medium"], {"default": "high"}),
+                "bit_depth": (_BD_BITS, {
+                    "default": "8",
+                    "tooltip": "10 и 12 бит работают только на тире pro"}),
+                "scale_ratio": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "0 — не использовать. Если задан, перекрывает "
+                               "target_resolution; потолок всё равно 4K"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "upscale"
+    CATEGORY = "fal/Upscale"
+
+    def upscale(self, video, target_resolution="1080p",
+                enhancement_preset="general", enhancement_tier="standard",
+                target_fps=0, fidelity="high", bit_depth="8", scale_ratio=0.0):
+        _require_deps()
+        if bit_depth != "8" and enhancement_tier != "pro":
+            raise RuntimeError(
+                f"{bit_depth}-битный вывод доступен только на тире pro, а сейчас "
+                f"выбран {enhancement_tier}. Переключи enhancement_tier на pro "
+                f"(он дороже в 10 раз) или верни bit_depth в 8.")
+        if scale_ratio and 0 < scale_ratio < 1.1:
+            raise RuntimeError(
+                f"scale_ratio принимает значения от 1.1 до 10, а задано "
+                f"{scale_ratio}. Поставь 0, чтобы использовать target_resolution.")
+
+        url, dur, w, h = _upload_video_input(video, label="видео для апскейла",
+                                             min_duration=None)
+        args = {
+            "video_url": url,
+            "enhancement_preset": enhancement_preset,
+            "enhancement_tier": enhancement_tier,
+            "fidelity": fidelity,
+            "bit_depth": bit_depth,
+        }
+        if scale_ratio and scale_ratio >= 1.1:
+            args["scale_ratio"] = float(scale_ratio)
+            if w and h and int(h * scale_ratio) > 2160:
+                print("[fal] scale_ratio ограничен 4K — fal понизит коэффициент")
+        else:
+            args["target_resolution"] = target_resolution
+        if target_fps and target_fps > 0:
+            args["target_fps"] = float(target_fps)
+
+        endpoint = "fal-ai/bytedance-upscaler/upscale/video"
+        rate = _BD_RATE.get(target_resolution)
+        if scale_ratio and scale_ratio >= 1.1:
+            rate = None                      # цель считает fal, тир заранее неясен
+        if rate and dur:
+            if enhancement_tier == "pro":
+                rate *= 10
+            fps = target_fps if target_fps and target_fps > 0 else 30
+            rate *= max(1.0, fps / 30.0)
+            cost = f"~${rate * dur:.3f}"
+        elif target_resolution in ("6k", "8k"):
+            cost = "тариф fal для 6K и 8K не опубликован"
+        else:
+            cost = "оценка недоступна"
+        print(f"[fal {endpoint}] {target_resolution}, пресет "
+              f"{enhancement_preset}, тир {enhancement_tier}, {bit_depth} бит"
+              + (f", {dur:.1f} с" if dur else "")
+              + f", ориентировочная стоимость: {cost}")
+
+        result = _run_request(endpoint, args, est_seconds=60 + (dur or 10) * 12)
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        return _finish(out["url"], "bytedance_upscale")
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -4296,6 +4671,10 @@ NODE_CLASS_MAPPINGS = {
     "FluxVisionUpscale_fal": FluxVisionUpscale,
     "LucidFluxRestore_fal": LucidFluxRestore,
     "FluxVideoUpscale_fal": FluxVideoUpscale,
+    "TopazVideoPrecision_fal": TopazVideoPrecision,
+    "TopazVideoGenerative_fal": TopazVideoGenerative,
+    "TopazVideoCreative_fal": TopazVideoCreative,
+    "BytedanceVideoUpscale_fal": BytedanceVideoUpscale,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
     "SAM2Video_fal": SAM2Video,
@@ -4330,10 +4709,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2TextToImage_fal": "GPT Image 2 (fal)",
     "GPTImage2Edit_fal": "GPT Image 2 Edit (fal)",
     "GPTImage25_fal": "GPT Image 2.5 Flare / Sunburst (fal)",
-    "TopazVideoUpscale_fal": "Topaz Video Upscale (fal)",
+    "TopazVideoUpscale_fal": "Topaz Video Upscale (fal, старый эндпоинт)",
     "FluxVisionUpscale_fal": "FLUX Vision Upscaler (fal)",
     "LucidFluxRestore_fal": "LucidFlux Restore / Upscale (fal)",
     "FluxVideoUpscale_fal": "FLUX Video Upscale (fal)",
+    "TopazVideoPrecision_fal": "Topaz Video Precision (fal)",
+    "TopazVideoGenerative_fal": "Topaz Video Generative / Starlight (fal)",
+    "TopazVideoCreative_fal": "Topaz Video Creative / Astra 2 (fal)",
+    "BytedanceVideoUpscale_fal": "ByteDance Video Upscale (fal)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",

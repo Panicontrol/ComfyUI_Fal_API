@@ -1,6 +1,6 @@
 # ComfyUI Fal API
 
-Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 35 узлов поверх облачных моделей:
+Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 39 узлов поверх облачных моделей:
 видео (Seedance, LTX-2.3, MiniMax H3, Kling, Wan), картинки (FLUX, GPT Image, Qwen,
 Seedream, Ideogram, Nano Banana), апскейл и реставрация, сегментация, обучение и
 конвертация LoRA. Локальная видеокарта не нужна — всё считается на стороне fal.
@@ -76,7 +76,11 @@ FAL_KEY = ваш-ключ
 
 | Нода | Эндпоинт fal | Что делает |
 |---|---|---|
-| Topaz Video Upscale | `fal-ai/topaz/upscale/video` | 19 моделей, до 8x, интерполяция кадров |
+| Topaz Video Precision | `topaz/upscale/video/precision` | 21 модель без дорисовки: Proteus, Iris, Dione, Artemis, Gaia, Rhea, Theia |
+| Topaz Video Generative / Starlight | `topaz/upscale/video/generative` | Диффузионный проход Starlight, Fast 2 вдвое дешевле |
+| Topaz Video Creative / Astra 2 | `topaz/upscale/video/creative` | Дорисовка деталей по промпту, самый дорогой тир |
+| ByteDance Video Upscale | `fal-ai/bytedance-upscaler/upscale/video` | До 8K, вывод в 10 и 12 бит, пресеты aigc / old_film / ugc |
+| Topaz Video Upscale (старый эндпоинт) | `fal-ai/topaz/upscale/video` | Единый эндпоинт прошлого поколения, оставлен для совместимости |
 | FLUX Video Upscale | `blackforestlabs/flux-video-upscale` | FLUX 3, режимы precise / creative, вход до 20 с |
 | FLUX Vision Upscaler | `fal-ai/flux-vision-upscaler` | До 4x по подписи от VLM, отдаёт подпись выходом |
 | LucidFlux Restore / Upscale | `fal-ai/lucidflux` | Реставрация битых и мыльных кадров |
