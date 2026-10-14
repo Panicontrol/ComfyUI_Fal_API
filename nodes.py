@@ -4723,6 +4723,176 @@ class BytedanceVideoUpscale:
         return res
 
 
+# ---------------------------------------------------------------------------
+# Утилита: видеофайл -> PNG-секвенция с сохранением битности (до 16 бит)
+# ---------------------------------------------------------------------------
+
+def _swscale_colorspace(frame):
+    """Матрица YUV->RGB для кадра: по тегу потока, а без тега — по
+    стандарту (HD и выше — BT.709, SD — BT.601), как делают плееры."""
+    from av.video.reformatter import Colorspace
+    tag = getattr(frame, "colorspace", None)    # AVColorSpace
+    if tag == 1:
+        return Colorspace.ITU709
+    if tag in (5, 6):
+        return Colorspace.ITU601
+    if tag in (9, 10):
+        return Colorspace.BT2020
+    return Colorspace.ITU709 if frame.height >= 720 else Colorspace.ITU601
+
+
+def _next_free_dir(base, prefix):
+    """ComfyUI/output/<prefix>_0001, _0002 … — прошлые прогоны не затираются."""
+    i = 1
+    while True:
+        d = os.path.join(base, f"{prefix}_{i:04d}")
+        if not os.path.exists(d):
+            return d
+        i += 1
+
+
+def _write_png_sequence(src, out_dir, prefix, bits, start, progress=None,
+                        check_interrupt=None):
+    """Декодирует src и пишет PNG по кадру. bits: 8 или 16.
+    Возвращает (число кадров, (ширина, высота), имя матрицы цвета)."""
+    import av
+    fmt = "rgb48be" if bits == 16 else "rgb24"       # то, что умеет PNG-энкодер
+    os.makedirs(out_dir, exist_ok=True)
+    enc, n, size, cs_name = None, 0, None, None
+    with av.open(src) as c:
+        stream = c.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in c.decode(stream):
+            if check_interrupt:
+                check_interrupt()
+            cs = _swscale_colorspace(frame)
+            cs_name = cs_name or {1: "BT.709", 5: "BT.601", 9: "BT.2020"}.get(
+                int(cs), str(cs))
+            rgb = frame.reformat(format=fmt, src_colorspace=cs)
+            if enc is None:
+                enc = av.CodecContext.create("png", "w")
+                enc.width, enc.height, enc.pix_fmt = rgb.width, rgb.height, fmt
+                enc.time_base = stream.time_base or __import__("fractions").Fraction(1, 24)
+                size = (rgb.width, rgb.height)
+            rgb.pts = n
+            path = os.path.join(out_dir, f"{prefix}_{start + n:05d}.png")
+            data = b"".join(bytes(p) for p in enc.encode(rgb))
+            with open(path, "wb") as f:
+                f.write(data)
+            n += 1
+            if progress:
+                progress(n)
+    return n, size, cs_name
+
+
+class SaveVideoPNGSequence:
+    """Сохраняет видеофайл PNG-секвенцией — автоматически на каждом прогоне
+    графа. Подключи ко входу local_path одноимённый выход любой нашей
+    видео-ноды (ByteDance, Topaz, FLUX, Seedance, H3 …).
+
+    Главное отличие от связки Get Video Components → Save Image: кадры
+    читаются прямо из скачанного файла, минуя внутренний 8-битный тип IMAGE,
+    поэтому 10- и 12-битный результат ByteDance уходит в 16-битный PNG без
+    потери точности. bit_depth = auto сам выбирает 16 бит для источников
+    глубже восьми и 8 бит для обычных.
+
+    Матрица цвета берётся из тега потока, а без тега — BT.709 для HD и выше.
+    Каждый прогон пишет в новую папку prefix_0001, prefix_0002 …, так что
+    прошлые результаты не затираются."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "local_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "подключи сюда выход local_path видео-ноды"}),
+                "prefix": ("STRING", {"default": "frame"}),
+                "bit_depth": (["auto", "16", "8"], {
+                    "default": "auto",
+                    "tooltip": "auto — 16 бит, если в исходнике больше 8, иначе 8"}),
+                "start_number": ("INT", {
+                    "default": 0, "min": 0, "max": 9999999,
+                    "tooltip": "номер первого кадра; в VFX часто 1001"}),
+            },
+            "optional": {
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "пусто — ComfyUI/output/<prefix>_NNNN; иначе "
+                               "кадры лягут прямо в эту папку"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("folder", "frame_count")
+    FUNCTION = "save"
+    CATEGORY = "fal/Utils"
+    OUTPUT_NODE = True
+
+    def save(self, local_path, prefix="frame", bit_depth="auto",
+             start_number=0, output_dir=""):
+        src = (local_path or "").strip().strip('"')
+        if not src or not os.path.isfile(src):
+            raise RuntimeError(
+                f"Видеофайл не найден: «{src}». Подключи ко входу local_path "
+                f"выход local_path видео-ноды.")
+        prefix = re.sub(r'[\\/:*?"<>|]+', "_", prefix.strip() or "frame")
+
+        info = _probe_codec_info(src)
+        src_bits = _bits_from_pix_fmt(info[2]) if info else 8
+        bits = (16 if src_bits > 8 else 8) if bit_depth == "auto" else int(bit_depth)
+        if bits == 8 and src_bits > 8:
+            print(f"[fal] ВНИМАНИЕ: исходник {src_bits}-битный, а сохраняю в 8 бит "
+                  f"— лишние биты будут потеряны. Для мастера ставь 16 или auto")
+
+        if output_dir.strip():
+            out_dir = output_dir.strip().strip('"')
+        else:
+            base = (folder_paths.get_output_directory() if folder_paths
+                    else tempfile.gettempdir())
+            out_dir = _next_free_dir(base, prefix)
+
+        dur, w, h = _probe_video_info(src)
+        fps = _probe_video_fps(src)
+        est = int(round((dur or 0) * (fps or 0))) or None
+        if est and w and h:
+            raw_gb = est * w * h * 3 * (2 if bits == 16 else 1) / 1024 ** 3
+            print(f"[fal] PNG-секвенция: ~{est} кадров {w}x{h}, {bits} бит -> "
+                  f"{out_dir}\n      без сжатия это ~{raw_gb:.1f} ГБ, PNG обычно "
+                  f"ужимает в 1.5–3 раза — проверь место на диске")
+
+        pbar = None
+        try:
+            from comfy.utils import ProgressBar
+            pbar = ProgressBar(est or 100)
+        except Exception:
+            pass
+        try:
+            import comfy.model_management as mm
+            check = mm.throw_exception_if_processing_interrupted
+        except Exception:
+            check = None
+
+        def progress(n):
+            if pbar is not None:
+                pbar.update_absolute(min(n, est or n), est or n)
+
+        try:
+            n, size, cs_name = _write_png_sequence(
+                src, out_dir, prefix, bits, int(start_number), progress, check)
+        except ImportError:
+            raise RuntimeError("Для сохранения секвенции нужен PyAV (пакет av) — "
+                               "он ставится вместе с ComfyUI; проверь окружение.")
+        if n == 0:
+            raise RuntimeError(f"В файле не нашлось ни одного кадра: {src}")
+        last = int(start_number) + n - 1
+        print(f"[fal] сохранено {n} кадров {size[0]}x{size[1]}, {bits} бит PNG, "
+              f"матрица {cs_name}: {prefix}_{int(start_number):05d}.png … "
+              f"{prefix}_{last:05d}.png\n      папка: {out_dir}")
+        return {"ui": {"text": [f"{n} кадров, {bits} бит → {out_dir}"]},
+                "result": (out_dir, n)}
+
+
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_fal": Seedance2TextToVideo,
     "Seedance2ImageToVideo_fal": Seedance2ImageToVideo,
@@ -4742,6 +4912,7 @@ NODE_CLASS_MAPPINGS = {
     "TopazVideoGenerative_fal": TopazVideoGenerative,
     "TopazVideoCreative_fal": TopazVideoCreative,
     "BytedanceVideoUpscale_fal": BytedanceVideoUpscale,
+    "SaveVideoPNGSequence_fal": SaveVideoPNGSequence,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
     "SAM2Video_fal": SAM2Video,
@@ -4784,6 +4955,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TopazVideoGenerative_fal": "Topaz Video Generative / Starlight (fal)",
     "TopazVideoCreative_fal": "Topaz Video Creative / Astra 2 (fal)",
     "BytedanceVideoUpscale_fal": "ByteDance Video Upscale (fal)",
+    "SaveVideoPNGSequence_fal": "Save Video as PNG Sequence (16-bit)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",

@@ -1,6 +1,6 @@
 # ComfyUI Fal API
 
-Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 39 узлов поверх облачных моделей:
+Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 40 узлов поверх облачных моделей:
 видео (Seedance, LTX-2.3, MiniMax H3, Kling, Wan), картинки (FLUX, GPT Image, Qwen,
 Seedream, Ideogram, Nano Banana), апскейл и реставрация, сегментация, обучение и
 конвертация LoRA. Локальная видеокарта не нужна — всё считается на стороне fal.
@@ -93,6 +93,7 @@ FAL_KEY = ваш-ключ
 | EVF-SAM Text Segment | `fal-ai/evf-sam` | Маска по текстовому описанию объекта |
 | FLUX LoRA Trainer | `fal-ai/flux-lora-fast-training`, `fal-ai/flux-lora-portrait-trainer` | Обучение LoRA прямо из IMAGE-батча графа |
 | LoRA Convert | локально | fp16 и понижение ранга через SVD, чтобы влезть в лимит fal в 1 ГБ |
+| Save Video as PNG Sequence (16-bit) | локально | Видеофайл по `local_path` → PNG-секвенция; 10/12-битный источник сохраняется в 16-битный PNG без потерь |
 
 ## Как это устроено
 
