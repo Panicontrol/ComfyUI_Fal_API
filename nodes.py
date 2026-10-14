@@ -3573,6 +3573,167 @@ class MinimaxH3MaxReference:
 
 
 # ---------------------------------------------------------------------------
+# MiniMax H3 Max Relight — переосвещение готового видео по сфере со светом
+# ---------------------------------------------------------------------------
+
+_RELIGHT_RES = ["768P", "480P", "1080P", "2K"]
+_RELIGHT_ASPECTS = ["adaptive"] + _H3_ASPECTS
+# $ за секунду подготовленного видео; 1080P и 2K — латентный апскейл из 768P
+_RELIGHT_RATE = {"480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32}
+_RELIGHT_FPS = 24
+_RELIGHT_MIN_FRAMES = 56          # 17*3 + 5, около 2.33 с
+_RELIGHT_MAX_SECONDS = 15.0
+
+
+def _relight_frames(src_frames_24):
+    """Сколько кадров останется после подготовки fal: длина обрезается
+    с конца до ближайшего снизу числа вида 17n+5."""
+    if src_frames_24 < 5:
+        return 0
+    return (src_frames_24 - 5) // 17 * 17 + 5
+
+
+def _resolve_image_ref(image, url_text, what):
+    """IMAGE-вход или строка (URL / локальный путь) -> URL в fal storage."""
+    if image is not None:
+        return _upload_image_input(image, 1)[0]
+    refs = _resolve_media_list(url_text, 1)
+    if refs:
+        return refs[0]
+    raise RuntimeError(f"Нет {what}: подключи IMAGE или укажи ссылку/путь.")
+
+
+class MinimaxH3MaxRelight:
+    """MiniMax H3 Max Relight — переосвещает готовое видео по картинке сферы
+    с нужным светом: цвет, направление, мягкость теней. Люди, движение,
+    камера и звук остаются как были. Промпта нет — описание кадра модель
+    пишет сама (вернётся в expanded_prompt).
+
+    Сфера: подключи IMAGE (например, рендер GPT Image) или дай ссылку/путь
+    в sphere_url. Удобно собрать её в Lighting studio на странице модели
+    у fal (сфера под камерой 45°) и скачать.
+
+    Тайминг: fal приводит видео к 24 fps и обрезает с конца до 17n+5
+    кадров (минимум 56, около 2.33 с; исходник до 15 с). Нода считает это
+    заранее и пишет в лог, сколько кадров вернётся.
+    Цена: $0.05 / $0.08 / $0.16 / $0.32 за секунду (480P / 768P / 1080P / 2K);
+    1080P и 2K — латентный апскейл из 768P."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "исходник до 15 с; на выходе "
+                                               "будет 24 fps"}),
+                "resolution": (_RELIGHT_RES, {
+                    "default": "768P",
+                    "tooltip": "480P и 768P — нативно; 1080P и 2K — "
+                               "латентный апскейл из 768P, в 2 и 4 раза дороже"}),
+                "aspect_ratio": (_RELIGHT_ASPECTS, {
+                    "default": "adaptive",
+                    "tooltip": "adaptive — как у исходника (сам fal по "
+                               "умолчанию ставит 16:9)"}),
+            },
+            "optional": {
+                "light_sphere": ("IMAGE", {
+                    "tooltip": "сфера с целевым светом; берётся первый кадр"}),
+                "sphere_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "ссылка или путь к картинке сферы, если "
+                               "light_sphere не подключён"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "relight"
+    CATEGORY = "fal/MiniMax"
+
+    def relight(self, video, resolution="768P", aspect_ratio="adaptive",
+                light_sphere=None, sphere_url="", seed=-1,
+                enable_safety_checker=True):
+        _require_deps()
+        endpoint = "minimax/h3-max/relight"
+        # сфера первой: если её нет, видео даже не загружаем
+        if light_sphere is None and not _split_media_refs(sphere_url):
+            raise RuntimeError(
+                "Нет сферы со светом: подключи IMAGE во вход light_sphere "
+                "или укажи ссылку/путь в sphere_url.")
+
+        url, dur, w, h, src_fps = _upload_video_input_ex(
+            video, label="видео для переосвещения", min_duration=None)
+
+        est = dur or 5.0
+        if dur is not None:
+            if dur > _RELIGHT_MAX_SECONDS + 0.05:
+                raise RuntimeError(
+                    f"Видео {dur:.2f} с, а Relight принимает до 15 с. "
+                    f"Обрежь ролик, например нодой trim в VideoHelperSuite.")
+            # округление: длительность контейнера бывает чуть меньше n/fps
+            src24 = int(round(dur * _RELIGHT_FPS))
+            out_frames = _relight_frames(src24)
+            if out_frames < _RELIGHT_MIN_FRAMES:
+                raise RuntimeError(
+                    f"Видео слишком короткое: {dur:.2f} с = {src24} кадров при "
+                    f"24 fps, а нужно минимум {_RELIGHT_MIN_FRAMES} (около "
+                    f"2.33 с).")
+            est = out_frames / _RELIGHT_FPS
+            lost = src24 - out_frames
+            print(f"[fal {endpoint}] исходник {dur:.2f} с"
+                  + (f", {src_fps:g} fps" if src_fps else "")
+                  + (f", {w}x{h}" if w and h else "")
+                  + f" -> {src24} кадров при 24 fps -> вернётся {out_frames} "
+                  f"кадров ({est:.2f} с)"
+                  + (f", обрезано с конца {lost}" if lost else ""))
+            if src_fps and abs(src_fps - _RELIGHT_FPS) > 0.01:
+                print(f"[fal] ВНИМАНИЕ: исходник {src_fps:g} fps, fal пересчитает "
+                      f"его в 24 fps (кадры будут выброшены или повторены). Для "
+                      f"покадровой подстановки в композ приведи исходник к 24 fps "
+                      f"заранее")
+        else:
+            print(f"[fal {endpoint}] длительность исходника прочитать не удалось "
+                  f"— число кадров на выходе заранее неизвестно")
+
+        args = {
+            "video_url": url,
+            "reference_image_url": _resolve_image_ref(
+                light_sphere, sphere_url, "сферы со светом"),
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        _seed_arg(args, seed)
+
+        rate = _RELIGHT_RATE.get(resolution, 0.08)
+        print(f"[fal {endpoint}] {resolution}, {aspect_ratio}, ориентировочная "
+              f"стоимость ~${rate * est:.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(30, int(est * 6) + 20))
+
+        caption = (result or {}).get("initial_caption") or ""
+        if caption:
+            print(f"[fal {endpoint}] подпись модели: {caption[:300]}"
+                  f"{'…' if len(caption) > 300 else ''}")
+        if (result or {}).get("seed") is not None:
+            print(f"[fal {endpoint}] seed: {result['seed']}")
+        res = _h3max_finish(result, "minimax_h3max_relight", endpoint)
+        try:
+            import av
+            with av.open(res[2]) as c:
+                v = c.streams.video[0]
+                n = v.frames or None
+                fps = float(v.average_rate) if v.average_rate else None
+            if n or fps:
+                print(f"[fal {endpoint}] результат: "
+                      + (f"{n} кадров" if n else "")
+                      + (f", {fps:g} fps" if fps else ""))
+        except Exception:
+            pass
+        return res
+
+
+# ---------------------------------------------------------------------------
 # Seedance 2.5 — до 30 секунд одним дублем, до 50 мультимодальных референсов
 # ---------------------------------------------------------------------------
 
@@ -4934,6 +5095,7 @@ NODE_CLASS_MAPPINGS = {
     "MinimaxH3Reference_fal": MinimaxH3Reference,
     "MinimaxH3MaxVideo_fal": MinimaxH3MaxVideo,
     "MinimaxH3MaxReference_fal": MinimaxH3MaxReference,
+    "MinimaxH3MaxRelight_fal": MinimaxH3MaxRelight,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4977,4 +5139,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MinimaxH3Reference_fal": "MiniMax H3 Reference-to-Video (fal)",
     "MinimaxH3MaxVideo_fal": "MiniMax H3 Max Video (fal)",
     "MinimaxH3MaxReference_fal": "MiniMax H3 Max Reference-to-Video (fal)",
+    "MinimaxH3MaxRelight_fal": "MiniMax H3 Max Relight (fal)",
 }

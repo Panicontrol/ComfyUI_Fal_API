@@ -1,6 +1,6 @@
 # ComfyUI Fal API
 
-Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 40 узлов поверх облачных моделей:
+Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 41 узел поверх облачных моделей:
 видео (Seedance, LTX-2.3, MiniMax H3, Kling, Wan), картинки (FLUX, GPT Image, Qwen,
 Seedream, Ideogram, Nano Banana), апскейл и реставрация, сегментация, обучение и
 конвертация LoRA. Локальная видеокарта не нужна — всё считается на стороне fal.
@@ -56,6 +56,7 @@ FAL_KEY = ваш-ключ
 | MiniMax H3 Reference-to-Video | `minimax/h3/reference-to-video[/lora]` | 9 картинок + 3 видео + 3 аудио |
 | MiniMax H3 Max Video | `minimax/h3-max[-turbo]/{text,image}-to-video` | Пост-тренированный fal вариант, быстрее реального времени |
 | MiniMax H3 Max Reference-to-Video | `minimax/h3-max/reference-to-video` | То же с мультимодальными референсами |
+| MiniMax H3 Max Relight | `minimax/h3-max/relight` | Переосвещение готового видео по картинке сферы со светом; движение, камера и звук сохраняются |
 | Kling Video | `fal-ai/kling-video/<версия>/<тир>/*-to-video` | 2.6 Pro и 2.1 master / pro / standard |
 | Wan 2.2 LoRA Video | `fal-ai/wan/v2.2-a14b/*/lora` | t2v / i2v с пользовательскими LoRA |
 

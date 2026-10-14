@@ -217,6 +217,11 @@ const CALCS = {
   MinimaxH3Reference_fal: h3Cost,
   MinimaxH3MaxVideo_fal: h3MaxCost,
   MinimaxH3MaxReference_fal: (v) => h3MaxCost({ ...v, model: "H3 Max" }),
+  // длину видео JS не знает — показываем тариф за секунду
+  MinimaxH3MaxRelight_fal: (v) => {
+    const rate = { "480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32 }[v.resolution] ?? 0.08;
+    return `${fmt(rate)}/с`;
+  },
   WanLoraVideo_fal: (v) => {
     const fps = v.frames_per_second || 16;
     const secs = (v.num_frames || 81) / (fps || 16);
