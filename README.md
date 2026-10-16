@@ -1,6 +1,6 @@
 # ComfyUI Fal API
 
-Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 41 узел поверх облачных моделей:
+Кастомные ноды ComfyUI для [fal.ai](https://fal.ai) — 44 узла поверх облачных моделей:
 видео (Seedance, LTX-2.3, MiniMax H3, Kling, Wan), картинки (FLUX, GPT Image, Qwen,
 Seedream, Ideogram, Nano Banana), апскейл и реставрация, сегментация, обучение и
 конвертация LoRA. Локальная видеокарта не нужна — всё считается на стороне fal.
@@ -85,6 +85,14 @@ FAL_KEY = ваш-ключ
 | FLUX Video Upscale | `blackforestlabs/flux-video-upscale` | FLUX 3, режимы precise / creative, вход до 20 с |
 | FLUX Vision Upscaler | `fal-ai/flux-vision-upscaler` | До 4x по подписи от VLM, отдаёт подпись выходом |
 | LucidFlux Restore / Upscale | `fal-ai/lucidflux` | Реставрация битых и мыльных кадров |
+
+### Интерполяция кадров и HDR
+
+| Нода | Эндпоинт | Что делает |
+|---|---|---|
+| Topaz Frame Interpolation | `topaz/interpolate/video` | Apollo / Chronos / Aion: смена частоты до 120 fps и слоумо до 8x |
+| Frame Interpolation FILM / RIFE | `fal-ai/film/video`, `fal-ai/rife/video` | Дешёвая интерполяция для черновиков и анимации, $0.0013 за секунду вычислений |
+| Topaz SDR to HDR | `topaz/sdr-to-hdr/video` | Hyperion 2.5: SDR → HDR10, 10-битный ProRes 422 HQ или H.265 |
 
 ### Сегментация, LoRA, утилиты
 

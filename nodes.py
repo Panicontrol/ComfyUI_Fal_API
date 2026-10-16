@@ -4885,6 +4885,343 @@ class BytedanceVideoUpscale:
 
 
 # ---------------------------------------------------------------------------
+# Интерполяция кадров и SDR->HDR: Topaz Interpolate, FILM / RIFE, Topaz Hyperion
+# ---------------------------------------------------------------------------
+
+_INTERP_CATEGORY = "fal/Video Tools"
+_TOPAZ_INTERP_MODELS = ["Apollo", "Chronos", "Aion"]
+# $ за сгенерированный кадр. fal: 10 с 30->60 fps (300 новых кадров) =
+# $0.30 / $0.60 у Apollo и Chronos (1080p / 4K), $0.50 / $1.70 у Aion.
+_TOPAZ_INTERP_RATE = {
+    "Apollo": {"1080p": 0.30 / 300, "4K": 0.60 / 300},
+    "Chronos": {"1080p": 0.30 / 300, "4K": 0.60 / 300},
+    "Aion": {"1080p": 0.50 / 300, "4K": 1.70 / 300},
+}
+# Hyperion 2.5, $ за секунду при 30 fps: $2.40 / $5.10 за 10 с
+_TOPAZ_HDR_RATE = {"1080p": 0.24, "4K": 0.51}
+
+
+def _probe_output_info(path):
+    """Что реально пришло: fps, число кадров, звук, кодек, pix_fmt и теги
+    цвета (primaries / transfer / matrix). Любое поле может быть None."""
+    info = {}
+    try:
+        import av
+        with av.open(path) as c:
+            v = c.streams.video[0]
+            cc = v.codec_context
+            rate = v.average_rate or v.guessed_rate
+            info["fps"] = float(rate) if rate else None
+            info["frames"] = v.frames or None
+            info["audio"] = bool(c.streams.audio)
+            info["codec"] = cc.name
+            info["profile"] = cc.profile or None
+            info["pix_fmt"] = cc.pix_fmt
+            info["size"] = (cc.width, cc.height)
+            for k in ("color_primaries", "color_trc", "colorspace"):
+                info[k] = getattr(cc, k, None)
+    except Exception:
+        pass
+    return info
+
+
+def _log_output_info(endpoint, info):
+    if not info:
+        return
+    parts = []
+    if info.get("codec"):
+        parts.append(info["codec"] + (f" {info['profile']}" if info.get("profile") else ""))
+    if info.get("pix_fmt"):
+        parts.append(f"{info['pix_fmt']} ({_bits_from_pix_fmt(info['pix_fmt'])} бит)")
+    if info.get("size"):
+        parts.append("%dx%d" % info["size"])
+    if info.get("fps"):
+        parts.append(f"{info['fps']:g} fps")
+    if info.get("frames"):
+        parts.append(f"{info['frames']} кадров")
+    if "audio" in info:
+        parts.append("со звуком" if info["audio"] else "без звука")
+    print(f"[fal {endpoint}] результат: " + ", ".join(parts))
+
+
+def _interp_tier(h):
+    return "4K" if h and h > 1080 else "1080p"
+
+
+class TopazFrameInterpolation:
+    """Topaz Interpolate — интерполяция кадров и слоумо моделями Apollo,
+    Chronos и Aion: смена частоты до 120 fps и замедление до 8x.
+    Разрешение остаётся как у исходника, ролик до 5 минут.
+
+    Chronos — классика для перевода частоты, Apollo лучше держит
+    нелинейное движение и слоумо, Aion — новейшая и самая дорогая.
+    target_fps = 0 — удвоить частоту исходника (24 -> 48).
+    slowdown_factor > 1 — замедление: ролик станет во столько же раз длиннее.
+    Цена по новым кадрам: 10 с 30->60 fps — $0.30 / $0.60 у Apollo и
+    Chronos (1080p / 4K), $0.50 / $1.70 у Aion."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "model": (_TOPAZ_INTERP_MODELS, {"default": "Apollo"}),
+                "target_fps": ("INT", {
+                    "default": 0, "min": 0, "max": 120,
+                    "tooltip": "0 — удвоить частоту исходника. Кратные "
+                               "частоты (24->48) дают предсказуемые кадры"}),
+                "slowdown_factor": ("INT", {
+                    "default": 1, "min": 1, "max": 8,
+                    "tooltip": "1 — только смена частоты; 2..8 — слоумо, "
+                               "дорисованные кадры тоже оплачиваются"}),
+                "H264_output": _TOPAZ_H264_INPUT,
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "interpolate"
+    CATEGORY = _INTERP_CATEGORY
+
+    def interpolate(self, video, model="Apollo", target_fps=0,
+                    slowdown_factor=1, H264_output=True):
+        _require_deps()
+        endpoint = "topaz/interpolate/video"
+        url, dur, w, h, src_fps = _upload_video_input_ex(
+            video, label="видео для интерполяции", min_duration=None)
+        if dur is not None and dur > _TOPAZ_MAX_INPUT_SEC:
+            raise RuntimeError(
+                f"На входе {dur / 60:.1f} мин, а Topaz принимает ролики не "
+                f"длиннее 5 минут. Нарежь на куски.")
+
+        if target_fps and target_fps > 0:
+            out_fps = int(target_fps)
+        elif src_fps:
+            out_fps = min(120, int(round(src_fps * 2)))
+            print(f"[fal] target_fps = 0: исходник {src_fps:g} fps -> "
+                  f"отправляю {out_fps}")
+        else:
+            raise RuntimeError(
+                "Частоту исходника прочитать не удалось — задай target_fps "
+                "вручную.")
+        if (slowdown_factor or 1) <= 1 and src_fps and out_fps <= src_fps + 0.01:
+            raise RuntimeError(
+                f"target_fps {out_fps} не выше частоты исходника "
+                f"({src_fps:g} fps) — интерполировать нечего. Подними "
+                f"target_fps или включи slowdown_factor.")
+        if src_fps and abs(out_fps / src_fps - round(out_fps / src_fps)) > 0.01:
+            print(f"[fal] {src_fps:g} -> {out_fps} fps — частота не кратная, "
+                  f"исходные кадры не попадут ровно в сетку выхода")
+
+        args = {"video_url": url, "model": model, "target_fps": out_fps,
+                "H264_output": bool(H264_output)}
+        if slowdown_factor and slowdown_factor > 1:
+            args["slowdown_factor"] = int(slowdown_factor)
+
+        cost = "оценка недоступна"
+        if dur and src_fps:
+            slow = max(1, int(slowdown_factor or 1))
+            new_frames = max(0.0, dur * slow * out_fps - dur * src_fps)
+            per = _TOPAZ_INTERP_RATE[model][_interp_tier(h)]
+            cost = f"~${per * new_frames:.2f} ({int(new_frames)} новых кадров" \
+                   + (", слоумо — оценка грубая" if slow > 1 else "") + ")"
+            print(f"[fal {endpoint}] {model}: {src_fps:g} -> {out_fps} fps"
+                  + (f", замедление {slow}x -> {dur * slow:.2f} с" if slow > 1 else "")
+                  + f", ожидаю ~{int(round(dur * slow * out_fps))} кадров")
+        print(f"[fal {endpoint}] ориентировочная стоимость: {cost}")
+
+        result = _run_request(endpoint, args,
+                              est_seconds=60 + int((dur or 10) * (slowdown_factor or 1) * 6))
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        res = _finish(out["url"], "topaz_interp")
+        _log_output_info(endpoint, _probe_output_info(res[2]))
+        return res
+
+
+_FILM_QUALITY = ["high", "maximum", "medium", "low"]
+_FILM_WRITE = ["balanced", "fast", "small"]
+
+
+class FrameInterpolationFILM:
+    """FILM / RIFE — дешёвая интерполяция кадров ($0.0013 за секунду
+    вычислений). FILM лучше переносит крупные смещения, RIFE быстрее.
+    Оба заметно грубее Topaz на окклюзиях и тонких деталях — годятся для
+    черновиков, превью и анимации.
+
+    num_frames — сколько кадров вставить между соседними: 1 удваивает
+    частоту, 3 — учетверяет. output_fps = 0 — частота считается сама
+    (исходник × (num_frames + 1)); другое число — выход в этой частоте,
+    то есть слоумо или ускорение. use_scene_detection не смешивает
+    кадры через склейки. video_quality и video_write_mode — только у FILM."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "model": (["FILM", "RIFE"], {"default": "FILM"}),
+                "num_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 16,
+                    "tooltip": "кадров между каждой парой исходных: 1 = x2 fps"}),
+                "use_scene_detection": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "не интерполировать через склейки"}),
+            },
+            "optional": {
+                "output_fps": ("INT", {
+                    "default": 0, "min": 0, "max": 240,
+                    "tooltip": "0 — исходник × (num_frames + 1). Своё число "
+                               "меняет скорость: 24 при x2 кадров = слоумо 2x"}),
+                "loop": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "дорисовать переход от последнего кадра к первому"}),
+                "video_quality": (_FILM_QUALITY, {
+                    "default": "high", "tooltip": "только FILM"}),
+                "video_write_mode": (_FILM_WRITE, {
+                    "default": "balanced", "tooltip": "только FILM"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "interpolate"
+    CATEGORY = _INTERP_CATEGORY
+
+    def interpolate(self, video, model="FILM", num_frames=1,
+                    use_scene_detection=True, output_fps=0, loop=False,
+                    video_quality="high", video_write_mode="balanced"):
+        _require_deps()
+        endpoint = "fal-ai/film/video" if model == "FILM" else "fal-ai/rife/video"
+        url, dur, w, h, src_fps = _upload_video_input_ex(
+            video, label="видео для интерполяции", min_duration=None)
+        k = int(num_frames) + 1
+        args = {
+            "video_url": url,
+            "num_frames": int(num_frames),
+            "use_scene_detection": bool(use_scene_detection),
+            "loop": bool(loop),
+        }
+        if output_fps and output_fps > 0:
+            args["use_calculated_fps"] = False
+            args["fps"] = int(output_fps)
+            fps_note = f"{int(output_fps)} fps"
+            if src_fps:
+                speed = output_fps / (src_fps * k)
+                fps_note += (f" (скорость x{speed:.2f} — "
+                             + ("слоумо" if speed < 0.99 else
+                                "ускорение" if speed > 1.01 else "как в исходнике")
+                             + ")")
+        else:
+            args["use_calculated_fps"] = True
+            fps_note = (f"~{src_fps * k:g} fps (исходник x{k})" if src_fps
+                        else f"исходник x{k}")
+        if model == "FILM":
+            args["video_quality"] = video_quality
+            args["video_write_mode"] = video_write_mode
+        print(f"[fal {endpoint}] +{num_frames} кадр(а) между соседними, выход "
+              f"{fps_note}; цена $0.0013 за секунду вычислений — заранее не "
+              f"оценить, обычно центы")
+
+        result = _run_request(endpoint, args, est_seconds=60 + int((dur or 10) * k * 3))
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        res = _finish(out["url"], f"{model.lower()}_interp")
+        info = _probe_output_info(res[2])
+        _log_output_info(endpoint, info)
+        if (src_fps and not (output_fps and output_fps > 0) and info.get("fps")
+                and abs(info["fps"] - src_fps * k) > 0.05):
+            print(f"[fal] ВНИМАНИЕ: ожидал {src_fps * k:g} fps, пришло "
+                  f"{info['fps']:g} — задай output_fps явно")
+        return res
+
+
+class TopazSDRtoHDR:
+    """Topaz SDR to HDR (Hyperion 2.5) — перевод SDR-видео в HDR.
+    Разрешение и частота сохраняются, ролик до 5 минут.
+
+    mp4 — 10-битный H.265 HDR10; prores — 10-битный ProRes 422 HQ в .mov,
+    его Topaz рекомендует для грейдинга (файлы намного больше). Цена одна:
+    при 30 fps $2.40 за 10 с до 1080p и $5.10 в 4K. Настроек пиковой
+    яркости нет. Выход video внутри ComfyUI 8-битный и без HDR — для
+    грейдинга бери файл по local_path."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "output_format": (["prores", "mp4"], {
+                    "default": "prores",
+                    "tooltip": "prores — ProRes 422 HQ 10 бит (.mov) для "
+                               "грейдинга; mp4 — H.265 HDR10 10 бит"}),
+            },
+        }
+
+    RETURN_TYPES = RETURN_TYPES
+    RETURN_NAMES = RETURN_NAMES
+    FUNCTION = "convert"
+    CATEGORY = _INTERP_CATEGORY
+
+    def convert(self, video, output_format="prores"):
+        _require_deps()
+        endpoint = "topaz/sdr-to-hdr/video"
+        url, dur, w, h, src_fps = _upload_video_input_ex(
+            video, label="SDR-видео", min_duration=None)
+        if dur is not None and dur > _TOPAZ_MAX_INPUT_SEC:
+            raise RuntimeError(
+                f"На входе {dur / 60:.1f} мин, а Topaz принимает ролики не "
+                f"длиннее 5 минут. Нарежь на куски.")
+        cost = "оценка недоступна"
+        if dur:
+            rate = _TOPAZ_HDR_RATE[_interp_tier(h)]
+            mult = max(1.0, (src_fps or 30) / 30.0)
+            cost = (f"~${rate * dur * mult:.2f} ({dur:.1f} с"
+                    + (f", {src_fps:g} fps — тариф пересчитан, оценка грубая"
+                       if mult > 1 else "") + ")")
+        print(f"[fal {endpoint}] Hyperion 2.5, {output_format}, "
+              f"ориентировочная стоимость: {cost}")
+
+        result = _run_request(endpoint, {"video_url": url,
+                                         "output_format": output_format},
+                              est_seconds=60 + int((dur or 10) * 15))
+        out = (result or {}).get("video") or {}
+        if not out.get("url"):
+            raise RuntimeError(f"fal не вернул видео: {result}")
+        ext = ".mov" if output_format == "prores" else None
+        res = _finish(out["url"], "topaz_hdr", ext)
+        info = _probe_output_info(res[2])
+        _log_output_info(endpoint, info)
+        def _name(table, v):
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                return v
+            return table.get(v, v)
+        prim = _name({1: "BT.709", 2: "не указаны", 9: "BT.2020"},
+                     info.get("color_primaries"))
+        trc = _name({1: "BT.709 (SDR!)", 2: "не указана", 14: "BT.2020 10-бит",
+                     16: "PQ (SMPTE ST 2084)", 18: "HLG (ARIB STD-B67)"},
+                    info.get("color_trc"))
+        mtx = _name({1: "BT.709", 2: "не указана", 9: "BT.2020 NCL"},
+                    info.get("colorspace"))
+        if info.get("color_trc") is not None:
+            print(f"[fal {endpoint}] теги цвета: primaries {prim}, "
+                  f"transfer {trc}, matrix {mtx}")
+            if trc == "не указана":
+                print("[fal] ВНИМАНИЕ: теги HDR в файле не проставлены — при "
+                      "импорте назначь Rec.2020 / PQ вручную")
+        print(f"[fal] HDR-мастер: {res[2]}\n"
+              f"      превью в ComfyUI будет тусклым и 8-битным — это нормально. "
+              f"В Resolve/Nuke интерпретируй файл как Rec.2100 PQ (если теги не "
+              f"указывают иное). PNG Sequence с bit_depth=16 сохранит "
+              f"PQ-сигнал без потерь, но это закодированный сигнал, не линейный свет")
+        return res
+
+
+# ---------------------------------------------------------------------------
 # Утилита: видеофайл -> PNG-секвенция с сохранением битности (до 16 бит)
 # ---------------------------------------------------------------------------
 
@@ -5073,6 +5410,9 @@ NODE_CLASS_MAPPINGS = {
     "TopazVideoGenerative_fal": TopazVideoGenerative,
     "TopazVideoCreative_fal": TopazVideoCreative,
     "BytedanceVideoUpscale_fal": BytedanceVideoUpscale,
+    "TopazFrameInterpolation_fal": TopazFrameInterpolation,
+    "FrameInterpolationFILM_fal": FrameInterpolationFILM,
+    "TopazSDRtoHDR_fal": TopazSDRtoHDR,
     "SaveVideoPNGSequence_fal": SaveVideoPNGSequence,
     "KlingVideo_fal": KlingVideo,
     "SAM2Image_fal": SAM2Image,
@@ -5117,6 +5457,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TopazVideoGenerative_fal": "Topaz Video Generative / Starlight (fal)",
     "TopazVideoCreative_fal": "Topaz Video Creative / Astra 2 (fal)",
     "BytedanceVideoUpscale_fal": "ByteDance Video Upscale (fal)",
+    "TopazFrameInterpolation_fal": "Topaz Frame Interpolation / Apollo, Chronos, Aion (fal)",
+    "FrameInterpolationFILM_fal": "Frame Interpolation FILM / RIFE (fal)",
+    "TopazSDRtoHDR_fal": "Topaz SDR to HDR / Hyperion 2.5 (fal)",
     "SaveVideoPNGSequence_fal": "Save Video as PNG Sequence (16-bit)",
     "KlingVideo_fal": "Kling Video (fal)",
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",

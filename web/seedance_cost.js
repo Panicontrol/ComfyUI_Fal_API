@@ -218,6 +218,11 @@ const CALCS = {
   MinimaxH3MaxVideo_fal: h3MaxCost,
   MinimaxH3MaxReference_fal: (v) => h3MaxCost({ ...v, model: "H3 Max" }),
   // длину видео JS не знает — показываем тариф за секунду
+  // длину видео JS не знает — показываем тариф
+  TopazFrameInterpolation_fal: (v) =>
+    v.model === "Aion" ? "$0.0017/кадр (4K $0.0057)" : "$0.001/кадр (4K $0.002)",
+  FrameInterpolationFILM_fal: () => "$0.0013/с вычислений",
+  TopazSDRtoHDR_fal: () => "$0.24/с (4K $0.51)",
   MinimaxH3MaxRelight_fal: (v) => {
     const rate = { "480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32 }[v.resolution] ?? 0.08;
     return `${fmt(rate)}/с`;
