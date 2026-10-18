@@ -217,6 +217,11 @@ const CALCS = {
   MinimaxH3Reference_fal: h3Cost,
   MinimaxH3MaxVideo_fal: h3MaxCost,
   MinimaxH3MaxReference_fal: (v) => h3MaxCost({ ...v, model: "H3 Max" }),
+  // обучение: max(100, шагов) × тариф режима
+  MinimaxH3LoraTrainer_fal: (v) => {
+    const rate = { t2v: 0.005, i2v: 0.01, flf2v: 0.01, ref2va: 0.015 }[v.mode] ?? 0.01;
+    return `≈ ${fmt(rate * Math.max(100, v.number_of_steps || 2000))}`;
+  },
   // длину видео JS не знает — показываем тариф за секунду
   // длину видео JS не знает — показываем тариф
   TopazFrameInterpolation_fal: (v) =>

@@ -2325,6 +2325,276 @@ class FluxLoraTrainer:
         return (local_path, lora_url, cfg_url)
 
 
+# $ за шаг обучения H3 LoRA; fal списывает max(100, number_of_steps) шагов
+_H3_TRAIN_RATE = {"t2v": 0.005, "i2v": 0.01, "flf2v": 0.01, "ref2va": 0.015}
+_H3_TRAIN_VIDEO_EXT = (".mp4", ".mov", ".avi", ".mkv")
+# доп. файлы клипа <stem>.<kind>.<ext>, которые принимает каждый режим
+_H3_TRAIN_SIDECARS = {
+    "t2v": (),
+    "i2v": ("first_frame",),
+    "flf2v": ("first_frame", "last_frame"),
+    "ref2va": ("ref_1", "ref_2", "ref_3", "ref_4"),
+}
+_H3_SIDECAR_RE = re.compile(r"^(.+)\.(first_frame|last_frame|ref_[1-4])\.([^.]+)$",
+                            re.IGNORECASE)
+
+
+def _h3_train_frames(n):
+    """Ближайшее допустимое число кадров: frames % 17 == 5, 22..124."""
+    k = min(7, max(1, round((int(n) - 5) / 17)))
+    return 17 * k + 5
+
+
+def _h3_train_files(folder, mode):
+    """Файлы датасета из папки: клипы, .txt-капшны с тем же именем и
+    доп. файлы режима (i2v/flf2v — кадры, ref2va — референсы)."""
+    allowed = _H3_TRAIN_SIDECARS[mode]
+    names = sorted(f for f in os.listdir(folder)
+                   if os.path.isfile(os.path.join(folder, f)))
+    clips, sidecars, skipped = [], [], []
+    for f in names:
+        m = _H3_SIDECAR_RE.match(f)
+        if m:
+            sidecars.append((m.group(1), m.group(2).lower(), f))
+        elif f.lower().endswith(_H3_TRAIN_VIDEO_EXT):
+            clips.append(f)
+    stems = {os.path.splitext(c)[0] for c in clips}
+    files = list(clips)
+    captions = 0
+    for f in names:
+        stem, ext = os.path.splitext(f)
+        if ext.lower() == ".txt" and stem in stems:
+            files.append(f)
+            captions += 1
+    for stem, kind, f in sidecars:
+        if stem in stems and kind in allowed:
+            files.append(f)
+        else:
+            skipped.append(f)
+    used = set(files)
+    skipped += [f for f in names if f not in used and f not in skipped]
+    return clips, captions, files, skipped
+
+
+class MinimaxH3LoraTrainer:
+    """Обучение LoRA для MiniMax H3 на fal. Датасет — папка с видеоклипами
+    (.mp4/.mov/.avi/.mkv) и капшнами .txt с тем же именем; нода упакует её
+    в zip и загрузит. Можно указать и готовый .zip или URL архива.
+    Режим определяет, под какую ноду генерации учится LoRA:
+      t2v — текст в видео; i2v — с первого кадра (<клип>.first_frame.png);
+      flf2v — по первому/последнему кадру (<клип>.first_frame.png,
+      <клип>.last_frame.png); ref2va — по референсам (<клип>.ref_1..ref_4.<ext>:
+      картинки, видео или звук).
+    Готовая LoRA скачивается в models/loras: t2v/i2v/flf2v подключаются в
+    MiniMax H3 Video LoRA (без картинки / с image / image + end_image),
+    ref2va — в MiniMax H3 Reference-to-Video.
+    ВНИМАНИЕ: обучение платное и идёт долго."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dataset": ("STRING", {
+                    "default": "",
+                    "tooltip": "папка с клипами и .txt-капшнами, путь к .zip "
+                               "или URL архива. Лучше от 10 клипов. Только "
+                               "видео: картинки как обучающие файлы fal отклонит"}),
+                "mode": (list(_H3_TRAIN_RATE), {
+                    "default": "t2v",
+                    "tooltip": "t2v $0.005/шаг, i2v и flf2v $0.01/шаг, "
+                               "ref2va $0.015/шаг (минимум 100 шагов)"}),
+                "trigger_phrase": ("STRING", {
+                    "default": "",
+                    "tooltip": "добавляется в начало каждого капшна"}),
+                "number_of_steps": ("INT", {"default": 2000, "min": 100,
+                                            "max": 15000, "step": 100}),
+                "rank": (["8", "16", "32", "64", "128"], {"default": "32"}),
+                "learning_rate": ("FLOAT", {"default": 0.0002, "min": 0.000001,
+                                            "max": 1.0, "step": 0.00001,
+                                            "round": False}),
+                "number_of_frames": ("INT", {
+                    "default": 73, "min": 22, "max": 124, "step": 17,
+                    "tooltip": "кадров в обучающем сэмпле: 22, 39, 56, 73, 90, "
+                               "107, 124 (frames % 17 == 5). Другое значение "
+                               "нода округлит до ближайшего допустимого"}),
+                "frame_rate": ("INT", {"default": 24, "min": 8, "max": 60}),
+                "resolution": (["low", "medium", "high"], {"default": "medium"}),
+                "aspect_ratio": (["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+                                 {"default": "16:9"}),
+            },
+            "optional": {
+                "first_frame_p": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "i2v/flf2v: вероятность обусловливания первым "
+                               "кадром. -1 = дефолт fal (i2v 0.5, flf2v 0.2)"}),
+                "last_frame_p": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "flf2v: последним кадром. -1 = дефолт fal (0.2)"}),
+                "first_last_frame_p": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "flf2v: первым и последним сразу. -1 = дефолт "
+                               "fal (0.4)"}),
+                "reference_p": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "ref2va: референсами. -1 = дефолт fal (0.9)"}),
+                "resume_from_lora_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "ref2va: продолжить с LoRA этого тренера "
+                               "(URL); ещё number_of_steps шагов"}),
+                "auto_scale_input": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "подогнать клипы под число кадров и fps"}),
+                "split_input_into_scenes": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "резать длинные клипы на сцены. Доп. файлы "
+                               "(кадры/референсы) у разрезанных клипов теряются"}),
+                "split_threshold": ("FLOAT", {
+                    "default": 30.0, "min": 1.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "резать клипы длиннее стольких секунд"}),
+                "strict_dataset": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "падать на пустых капшнах, нехватке доп. файлов "
+                               "и клипах без звука вместо подстановки дефолтов"}),
+                "debug_dataset": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "вернуть архив датасета после препроцессинга fal"}),
+                "output_name": ("STRING", {"default": "",
+                                           "tooltip": "имя .safetensors; пусто = авто"}),
+                "auto_download": ("BOOLEAN", {"default": True,
+                                              "tooltip": "скачать LoRA в models/loras"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("lora_path", "lora_url", "config_url", "debug_dataset_url")
+    FUNCTION = "train"
+    CATEGORY = "fal/Train"
+    OUTPUT_NODE = True
+
+    def _upload_dataset(self, dataset, mode):
+        import zipfile
+        src = (dataset or "").strip().strip('"')
+        if not src:
+            raise ValueError("dataset: укажи папку с клипами, .zip или URL")
+        if src.startswith(("http://", "https://")):
+            return src
+        if os.path.isfile(src):
+            if not src.lower().endswith(".zip"):
+                raise ValueError(f"dataset: ожидалась папка или .zip — {src}")
+            print(f"[fal H3 train] загружаю архив {src}")
+            return fal_client.upload_file(src)
+        if not os.path.isdir(src):
+            raise ValueError(f"dataset: папка не найдена — {src}")
+
+        clips, captions, files, skipped = _h3_train_files(src, mode)
+        if not clips:
+            raise ValueError(f"dataset: в {src} нет клипов "
+                             f"({', '.join(_H3_TRAIN_VIDEO_EXT)})")
+        if len(clips) < 10:
+            print(f"[fal H3 train] предупреждение: {len(clips)} клипов — "
+                  f"fal рекомендует минимум 10")
+        if skipped:
+            print(f"[fal H3 train] не вошли в датасет ({mode}): "
+                  f"{', '.join(skipped[:10])}"
+                  + (f" и ещё {len(skipped) - 10}" if len(skipped) > 10 else ""))
+        extra = len(files) - len(clips) - captions
+        fd, zip_path = tempfile.mkstemp(prefix="h3_train_", suffix=".zip")
+        os.close(fd)
+        try:
+            # видео уже сжато — кладём без компрессии
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
+                for f in files:
+                    z.write(os.path.join(src, f), f)
+            print(f"[fal H3 train] загружаю датасет: {len(clips)} клипов, "
+                  f"капшнов: {captions}, доп. файлов: {extra} "
+                  f"({os.path.getsize(zip_path)/1e6:.0f} МБ)")
+            return fal_client.upload_file(zip_path)
+        finally:
+            try:
+                os.unlink(zip_path)
+            except OSError:
+                pass
+
+    def train(self, dataset, mode, trigger_phrase, number_of_steps, rank,
+              learning_rate, number_of_frames, frame_rate, resolution,
+              aspect_ratio, first_frame_p=-1.0, last_frame_p=-1.0,
+              first_last_frame_p=-1.0, reference_p=-1.0,
+              resume_from_lora_url="", auto_scale_input=False,
+              split_input_into_scenes=True, split_threshold=30.0,
+              strict_dataset=False, debug_dataset=False, output_name="",
+              auto_download=True):
+        _require_deps()
+        frames = _h3_train_frames(number_of_frames)
+        if frames != number_of_frames:
+            print(f"[fal H3 train] number_of_frames {number_of_frames} -> "
+                  f"{frames} (нужно frames % 17 == 5)")
+
+        endpoint = f"minimax/h3/{mode}/trainer"
+        args = {
+            "training_data_url": self._upload_dataset(dataset, mode),
+            "number_of_steps": int(number_of_steps),
+            "rank": int(rank),
+            "learning_rate": float(learning_rate),
+            "number_of_frames": frames,
+            "frame_rate": int(frame_rate),
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "auto_scale_input": bool(auto_scale_input),
+            "split_input_into_scenes": bool(split_input_into_scenes),
+            "split_input_duration_threshold": float(split_threshold),
+            "strict_dataset": bool(strict_dataset),
+            "debug_dataset": bool(debug_dataset),
+        }
+        if trigger_phrase.strip():
+            args["trigger_phrase"] = trigger_phrase.strip()
+        probs = {
+            "i2v": {"first_frame_conditioning_p": first_frame_p},
+            "flf2v": {"first_frame_conditioning_p": first_frame_p,
+                      "last_frame_conditioning_p": last_frame_p,
+                      "first_last_frame_conditioning_p": first_last_frame_p},
+            "ref2va": {"reference_conditioning_p": reference_p},
+        }.get(mode, {})
+        for k, v in probs.items():
+            if v >= 0:
+                args[k] = float(v)
+        if mode == "ref2va" and resume_from_lora_url.strip():
+            args["resume_from_lora_url"] = resume_from_lora_url.strip()
+
+        cost = _H3_TRAIN_RATE[mode] * max(100, int(number_of_steps))
+        print(f"[fal {endpoint}] старт обучения: {number_of_steps} шагов, "
+              f"rank {rank}, {frames} кадров. Ориентировочная стоимость "
+              f"~${cost:.2f} (задача платная и долгая)")
+        result = _run_request(endpoint, args,
+                              est_seconds=number_of_steps * 1.5 + 600) or {}
+        lora_url = (result.get("lora_file") or {}).get("url")
+        cfg_url = (result.get("config_file") or {}).get("url", "")
+        dbg_url = (result.get("debug_dataset") or {}).get("url", "")
+        if not lora_url:
+            raise RuntimeError(f"fal не вернул LoRA: {result}")
+        if dbg_url:
+            print(f"[fal H3 train] датасет после препроцессинга: {dbg_url}")
+
+        local_path = ""
+        if auto_download:
+            base = output_name.strip() or \
+                f"h3_{mode}_{trigger_phrase.strip() or 'lora'}"
+            base = re.sub(r'[\\/:*?"<>|\s]+', "_", base)
+            if base.endswith(".safetensors"):
+                base = base[:-len(".safetensors")]
+            loras_dir = LoraConvert._loras_dir()
+            local_path = os.path.join(loras_dir, base + ".safetensors")
+            i = 2
+            while os.path.exists(local_path):  # платную LoRA не перезаписываем
+                local_path = os.path.join(loras_dir, f"{base}_{i}.safetensors")
+                i += 1
+            data = _download_bytes(lora_url)
+            with open(local_path, "wb") as f:
+                f.write(data)
+            print(f"[fal H3 train] LoRA сохранена: {local_path} "
+                  f"({len(data)/1e6:.0f} МБ)")
+        return (local_path, lora_url, cfg_url, dbg_url)
+
+
 class QwenImageEditLora:
     """Qwen-Image Edit Plus (2509) с пользовательскими LoRA (до 3). Принимает
     несколько картинок (image + image_2 + image_3 + URL) — редактирование и
@@ -5425,6 +5695,7 @@ NODE_CLASS_MAPPINGS = {
     "FluxLoraImage_fal": FluxLoraImage,
     "Flux2LoraImage_fal": Flux2LoraImage,
     "FluxLoraTrainer_fal": FluxLoraTrainer,
+    "MinimaxH3LoraTrainer_fal": MinimaxH3LoraTrainer,
     "QwenImageEditLora_fal": QwenImageEditLora,
     "WanLoraVideo_fal": WanLoraVideo,
     "LoraConvert_fal": LoraConvert,
@@ -5472,6 +5743,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxLoraImage_fal": "FLUX.1 LoRA (fal)",
     "Flux2LoraImage_fal": "FLUX.2 LoRA (fal)",
     "FluxLoraTrainer_fal": "FLUX LoRA Trainer (fal)",
+    "MinimaxH3LoraTrainer_fal": "MiniMax H3 LoRA Trainer (fal)",
     "QwenImageEditLora_fal": "Qwen-Image Edit LoRA (fal)",
     "WanLoraVideo_fal": "Wan 2.2 LoRA Video (fal)",
     "LoraConvert_fal": "LoRA Convert fp16 / уменьшить ранг",

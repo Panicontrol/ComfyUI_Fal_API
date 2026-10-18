@@ -101,8 +101,36 @@ FAL_KEY = ваш-ключ
 | SAM 2 Image / Video Segment | `fal-ai/sam2/{image,video}` | Маски по точкам и боксам, трекинг по ролику |
 | EVF-SAM Text Segment | `fal-ai/evf-sam` | Маска по текстовому описанию объекта |
 | FLUX LoRA Trainer | `fal-ai/flux-lora-fast-training`, `fal-ai/flux-lora-portrait-trainer` | Обучение LoRA прямо из IMAGE-батча графа |
+| MiniMax H3 LoRA Trainer | `minimax/h3/{t2v,i2v,flf2v,ref2va}/trainer` | LoRA для H3 из папки клипов с капшнами; цена max(100, шагов) × $0.005–0.015 |
 | LoRA Convert | локально | fp16 и понижение ранга через SVD, чтобы влезть в лимит fal в 1 ГБ |
 | Save Video as PNG Sequence (16-bit) | локально | Видеофайл по `local_path` → PNG-секвенция; 10/12-битный источник сохраняется в 16-битный PNG без потерь |
+
+## Обучение LoRA для MiniMax H3
+
+Нода **MiniMax H3 LoRA Trainer** принимает папку (или готовый `.zip`, или URL архива).
+Из папки в архив попадают только файлы, которые нужны выбранному режиму:
+
+```
+dataset/
+  clip01.mp4              # клипы: .mp4 .mov .avi .mkv, лучше от 10 штук
+  clip01.txt              # капшн, необязательно; trigger_phrase добавится в начало
+  clip01.first_frame.png  # i2v, flf2v: свой первый кадр (иначе берётся из клипа)
+  clip01.last_frame.png   # flf2v: свой последний кадр
+  clip01.ref_1.png        # ref2va: референсы ref_1..ref_4 — картинка, видео или звук
+```
+
+| Режим | Генерация с LoRA | $ за шаг |
+|---|---|---|
+| `t2v` | MiniMax H3 Video LoRA без картинки | 0.005 |
+| `i2v` | MiniMax H3 Video LoRA с `image` | 0.01 |
+| `flf2v` | MiniMax H3 Video LoRA с `image` + `end_image` | 0.01 |
+| `ref2va` | MiniMax H3 Reference-to-Video | 0.015 |
+
+Оплачивается max(100, `number_of_steps`) шагов: 2000 шагов по умолчанию в t2v стоят $10.
+`number_of_frames` должно давать остаток 5 при делении на 17 (22, 39, 56, 73, 90, 107, 124),
+другое значение нода округлит. Картинки как обучающие файлы fal не принимает. Если клип
+разрезается на сцены (`split_input_into_scenes`), его доп. файлы не используются. Готовая
+LoRA скачивается в `models/loras`, существующий файл с тем же именем не перезаписывается.
 
 ## Как это устроено
 
