@@ -71,7 +71,7 @@ FAL_KEY = ваш-ключ
 | Qwen-Image Edit LoRA | `fal-ai/qwen-image-edit-plus-lora` | Правка по нескольким картинкам с LoRA |
 | Seedream 5.0 Pro | `bytedance/seedream/v5/pro/{text-to-image,edit}` | Генерация и редактирование |
 | Ideogram V4 / V3 Edit | `ideogram/v4`, `fal-ai/ideogram/v3/edit` | Сильная типографика, инпейнт |
-| Nano Banana 2 / Pro Edit | `fal-ai/nano-banana-{2,pro}/edit` | Правка по референсам |
+| Nano Banana 2 / 2.1 / Pro Edit | `fal-ai/nano-banana-{2,pro}/edit`, `google/nano-banana-2.1/edit` | Правка по референсам (до 14); 2.1 считается по токенам, ~$0.04 за 1K |
 
 ### Апскейл и реставрация
 

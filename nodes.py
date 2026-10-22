@@ -1496,6 +1496,7 @@ class QwenImageMax:
 NB_MODELS = {
     "nano-banana-2": "fal-ai/nano-banana-2/edit",
     "nano-banana-pro": "fal-ai/nano-banana-pro/edit",
+    "nano-banana-2.1": "google/nano-banana-2.1/edit",
 }
 NB_ASPECTS = ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1",
               "4:5", "3:4", "2:3", "9:16"]
@@ -1507,10 +1508,22 @@ _NB_PRICE = {
     "nano-banana-pro": {"0.5K": 0.15, "1K": 0.15, "2K": 0.15, "4K": 0.30},
 }
 
+# Nano Banana 2.1 считается по токенам Google: $ за 1M токенов и токены
+# выходной картинки по разрешению (входная картинка ~1120 токенов)
+_NB21_IN, _NB21_OUT_IMAGE = 1.764, 35.294
+_NB21_IMAGE_TOKENS = {"1K": 1120, "2K": 1680, "4K": 3780}
+
+
+def _nb21_cost(resolution, n_inputs, num_images):
+    """Без токенов размышления и веб-поиска; prompt ~100 токенов."""
+    per = (_NB21_IMAGE_TOKENS.get(resolution, 1120) * _NB21_OUT_IMAGE
+           + (n_inputs * 1120 + 100) * _NB21_IN) / 1e6
+    return per * num_images
+
 
 class NanoBananaEdit:
     """Редактирование/композиция картинок моделями Google Nano Banana 2 /
-    Nano Banana Pro через fal. До 4 референсов сокетами + список URL.
+    2.1 / Pro через fal. До 4 референсов сокетами + список URL.
     В промпте можно ссылаться на референсы по порядку подачи."""
 
     @classmethod
@@ -1529,9 +1542,12 @@ class NanoBananaEdit:
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "system_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "thinking_level": (["off", "minimal", "high"], {
+                "thinking_level": (["off", "minimal", "medium", "high"], {
                     "default": "off",
-                    "tooltip": "Только nano-banana-2; high +$0.002/запрос"}),
+                    "tooltip": "nano-banana-2: minimal/high, medium = high, "
+                               "high +$0.002/запрос. nano-banana-2.1 думает "
+                               "всегда: off = дефолт fal (medium), размышления "
+                               "оплачиваются токенами. Pro: не используется"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
                 "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
             },
@@ -1554,7 +1570,8 @@ class NanoBananaEdit:
         urls += _resolve_media_list(extra_image_urls, 14 - len(urls))
 
         # 0.5K поддерживает только nano-banana-2
-        if model == "nano-banana-pro" and resolution == "0.5K":
+        if model != "nano-banana-2" and resolution == "0.5K":
+            print(f"[fal {model}] 0.5K не поддерживается — генерирую 1K")
             resolution = "1K"
 
         args = {
@@ -1568,13 +1585,22 @@ class NanoBananaEdit:
         if system_prompt.strip():
             args["system_prompt"] = system_prompt
         if model == "nano-banana-2" and thinking_level != "off":
+            # у 2 только minimal/high
+            args["thinking_level"] = "high" if thinking_level == "medium" else thinking_level
+        elif model == "nano-banana-2.1" and thinking_level != "off":
             args["thinking_level"] = thinking_level
         _seed_arg(args, seed)
 
-        price = _NB_PRICE[model].get(resolution, 0.08) * num_images
         endpoint = NB_MODELS[model]
-        print(f"[fal {endpoint}] ориентировочная стоимость: ~${price:.2f} "
-              f"({num_images} шт, {resolution})")
+        if model == "nano-banana-2.1":
+            price = _nb21_cost(resolution, len(urls), num_images)
+            print(f"[fal {endpoint}] ориентировочная стоимость: ~${price:.3f} "
+                  f"({num_images} шт, {resolution}, входов {len(urls)}) "
+                  f"+ токены размышления")
+        else:
+            price = _NB_PRICE[model].get(resolution, 0.08) * num_images
+            print(f"[fal {endpoint}] ориентировочная стоимость: ~${price:.2f} "
+                  f"({num_images} шт, {resolution})")
         result = _run_request(endpoint, args, est_seconds=30 * num_images)
         img_urls = [i["url"] for i in (result or {}).get("images", [])
                     if i.get("url")]
@@ -5736,7 +5762,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM2Image_fal": "SAM 2 Image Segment (fal)",
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",
     "EVFSAM_fal": "EVF-SAM Text Segment (fal)",
-    "NanoBananaEdit_fal": "Nano Banana 2 / Pro Edit (fal)",
+    "NanoBananaEdit_fal": "Nano Banana 2 / 2.1 / Pro Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
     "IdeogramImage_fal": "Ideogram V4 / V3 Edit (fal)",

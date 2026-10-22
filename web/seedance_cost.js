@@ -116,6 +116,12 @@ const NB_PRICE = {
 };
 
 function nanoBananaCost(v) {
+  if (v.model === "nano-banana-2.1") {
+    // токены Google: выходная картинка + 1 входная + короткий промпт, без размышлений
+    const out = { "1K": 1120, "2K": 1680, "4K": 3780 }[v.resolution] ?? 1120;
+    const per = (out * 35.294 + (1120 + 100) * 1.764) / 1e6;
+    return `≈ ${fmt(per * (v.num_images || 1))}+`;
+  }
   const table = NB_PRICE[v.model] || NB_PRICE["nano-banana-2"];
   const per = table[v.resolution] ?? 0.08;
   return `≈ ${fmt(per * (v.num_images || 1))}`;
