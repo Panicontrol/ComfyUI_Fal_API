@@ -1612,6 +1612,236 @@ class NanoBananaEdit:
 
 
 # ---------------------------------------------------------------------------
+# Bria Fibo 2.0 — Edit
+# ---------------------------------------------------------------------------
+
+FIBO2_ASPECTS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+                 "16:10", "10:16", "21:9", "9:21", "5:4", "4:5", "2:1", "1:2",
+                 "3:1", "1:3", "4:1", "1:4", "5:1", "1:5"]
+
+
+def _random_seed():
+    import random
+    return random.randint(0, 2147483647)
+
+
+class Fibo2Edit:
+    """Bria Fibo 2.0 Edit через fal: правка по инструкции, мультиреференс
+    до 4 картинок (<image_1>…<image_4> в инструкции) и правка по маске.
+    Инструкция разворачивается в VGL — структурированный JSON-промпт; он
+    возвращается в выходе vgl, и его можно поправить и подать обратно во
+    вход vgl. Маска — только для одной картинки: вне маски пиксели исходника
+    сохраняются. Цена $0.04 за картинку."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_1": ("IMAGE",),
+                "instruction": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "что изменить; на картинки ссылайся как "
+                               "<image_1>, <image_2>. Пусто — правка целиком "
+                               "из vgl (там нужен edit_instruction)"}),
+            },
+            "optional": {
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "mask": ("MASK", {
+                    "tooltip": "1 = перерисовать. Только с одной картинкой"}),
+                "vgl": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "VGL (JSON) из прошлого запуска. С instruction — "
+                               "описание первой картинки, от которого пишется "
+                               "правка; без неё — правка как есть"}),
+                "aspect_ratio": (FIBO2_ASPECTS, {
+                    "default": "auto",
+                    "tooltip": "auto — как у первой картинки. Одна картинка "
+                               "всегда сохраняет своё соотношение"}),
+                "seed": ("INT", {
+                    "default": -1, "min": -1, "max": 2147483647,
+                    "tooltip": "-1 — случайный (у fal по умолчанию всегда 5555)"}),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("image", "image_url", "vgl")
+    FUNCTION = "edit"
+    CATEGORY = "fal/Bria"
+
+    def edit(self, image_1, instruction, image_2=None, image_3=None,
+             image_4=None, mask=None, vgl="", aspect_ratio="auto", seed=-1,
+             extra_image_urls=""):
+        import json
+        _require_deps()
+        endpoint = "bria/fibo-2/edit"
+        vgl_doc = None
+        if vgl.strip():
+            try:
+                vgl_doc = json.loads(vgl)
+            except ValueError as e:
+                raise RuntimeError(f"vgl — не JSON: {e}") from e
+            if not isinstance(vgl_doc, dict):
+                raise RuntimeError("vgl должен быть JSON-объектом {...}")
+        if not instruction.strip() and not (vgl_doc or {}).get("edit_instruction"):
+            raise RuntimeError("Нужна instruction или vgl с edit_instruction")
+
+        images = [i for i in (image_1, image_2, image_3, image_4) if i is not None]
+        n_imgs = sum(int(i.shape[0]) for i in images)
+        if mask is not None and (n_imgs > 1 or _split_media_refs(extra_image_urls)):
+            raise RuntimeError("Маска работает только с одной картинкой")
+
+        urls = []
+        for img in images:
+            urls += _upload_image_input(img, 4 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 4 - len(urls))
+        if n_imgs + len(_split_media_refs(extra_image_urls)) > 4:
+            print(f"[fal {endpoint}] больше 4 картинок — беру первые 4")
+
+        args = {"image_urls": urls}
+        if instruction.strip():
+            args["instruction"] = instruction.strip()
+        if vgl_doc:
+            args["vgl"] = vgl_doc
+        if aspect_ratio != "auto":
+            args["aspect_ratio"] = aspect_ratio
+        if mask is not None:
+            h, w = int(image_1.shape[1]), int(image_1.shape[2])
+            m = mask if mask.ndim == 3 else mask.unsqueeze(0)
+            if tuple(m.shape[1:]) != (h, w):
+                import torch.nn.functional as F
+                m = F.interpolate(m[:1, None].float(), size=(h, w),
+                                  mode="nearest")[:, 0]
+            args["mask_url"] = _mask_to_bw_url(m)
+        args["seed"] = seed if seed >= 0 else _random_seed()
+
+        print(f"[fal {endpoint}] картинок {len(urls)}"
+              + (", с маской" if mask is not None else "")
+              + f", seed {args['seed']}, ориентировочная стоимость ~$0.04")
+        result = _run_request(endpoint, args, est_seconds=40) or {}
+        url = (result.get("image") or {}).get("url") or next(
+            (i.get("url") for i in result.get("images") or [] if i.get("url")), None)
+        if not url:
+            raise RuntimeError(f"fal не вернул изображение: {result}")
+        vgl_out = json.dumps(result.get("vgl") or {}, ensure_ascii=False, indent=2)
+        return (_download_images_as_tensor([url]), url, vgl_out)
+
+
+# ---------------------------------------------------------------------------
+# FLUX.3 Klein (Black Forest Labs) — Edit
+# ---------------------------------------------------------------------------
+
+def _klein_cost(px):
+    """Плановая цена fal за картинку по мегапикселям выхода."""
+    mp = px / 1e6
+    for limit, price in ((0.6, 0.008), (1.1, 0.009), (2.4, 0.011), (4.3, 0.014)):
+        if mp <= limit:
+            return price
+    return 0.036
+
+
+class Flux3KleinEdit:
+    """FLUX.3 Klein Edit (Black Forest Labs) через fal: правка и композиция
+    по 1–10 референсам. Промпт — полное описание итоговой картинки с уже
+    внесённой правкой; на референсы ссылайся по порядку: the first image,
+    the second image. bounding_boxes — необязательная раскладка объектов
+    (JSON-список, см. схему fal). Цена плановая: ~$0.009 за 1K."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_1": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_size": (["auto"] + IMG_SIZES, {
+                    "default": "auto",
+                    "tooltip": "auto — размер единственного референса (до 4 МП) "
+                               "или первого из нескольких (до 1 МП)"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+            },
+            "optional": {
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "extra_image_urls": ("STRING", {"multiline": True, "default": ""}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096,
+                                         "tooltip": ">0 вместе с custom_height "
+                                                    "перекрывает image_size"}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096}),
+                "enable_prompt_expansion": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "fal дописывает промпт по референсам; выкл — "
+                               "промпт идёт как есть"}),
+                "bounding_boxes": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "JSON-список боксов: description, label, box "
+                               "{x_min,y_min,x_max,y_max} в долях 0–1 и т.д."}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "image_urls", "prompt")
+    FUNCTION = "edit"
+    CATEGORY = "fal/FLUX"
+
+    def edit(self, image_1, prompt, image_size, num_images, image_2=None,
+             image_3=None, image_4=None, extra_image_urls="", custom_width=0,
+             custom_height=0, enable_prompt_expansion=True, bounding_boxes="",
+             seed=-1, enable_safety_checker=True):
+        import json
+        _require_deps()
+        endpoint = "blackforestlabs/flux-3/klein/edit-image"
+        if not prompt.strip():
+            raise RuntimeError("Нужен prompt: описание итоговой картинки")
+        urls = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                urls += _upload_image_input(img, 10 - len(urls))
+        urls += _resolve_media_list(extra_image_urls, 10 - len(urls))
+
+        args = {
+            "prompt": prompt,
+            "image_urls": urls,
+            "num_images": num_images,
+            "enable_prompt_expansion": bool(enable_prompt_expansion),
+            "enable_safety_checker": bool(enable_safety_checker),
+            "output_format": "png",
+        }
+        if custom_width > 0 and custom_height > 0:
+            args["image_size"] = {"width": custom_width, "height": custom_height}
+            px = custom_width * custom_height
+        elif image_size != "auto":
+            args["image_size"] = image_size
+            px = _PRESET_PX.get(image_size, 1024 * 1024)
+        else:
+            px = int(image_1.shape[1]) * int(image_1.shape[2])
+            px = min(px, 4_000_000 if len(urls) == 1 else 1_000_000)
+        if bounding_boxes.strip():
+            try:
+                boxes = json.loads(bounding_boxes)
+            except ValueError as e:
+                raise RuntimeError(f"bounding_boxes — не JSON: {e}") from e
+            args["bounding_boxes"] = boxes if isinstance(boxes, list) else [boxes]
+        _seed_arg(args, seed)
+
+        price = _klein_cost(px) * num_images
+        print(f"[fal {endpoint}] референсов {len(urls)}, ~{px/1e6:.1f} МП, "
+              f"ориентировочная стоимость ~${price:.3f} (плановая цена fal)")
+        result = _run_request(endpoint, args, est_seconds=20 * num_images) or {}
+        img_urls = [i["url"] for i in result.get("images", []) if i.get("url")]
+        if not img_urls:
+            raise RuntimeError(f"fal не вернул изображения: {result}")
+        if result.get("seed") is not None:
+            print(f"[fal {endpoint}] seed: {result['seed']}")
+        return (_download_images_as_tensor(img_urls), "\n".join(img_urls),
+                result.get("prompt") or "")
+
+
+# ---------------------------------------------------------------------------
 # Kling (Kuaishou) — видео
 # ---------------------------------------------------------------------------
 
@@ -4029,6 +4259,159 @@ class MinimaxH3MaxRelight:
         return res
 
 
+
+# ---------------------------------------------------------------------------
+# MiniMax H3 Max — Reframe и Recast
+# ---------------------------------------------------------------------------
+
+_REFRAME_RATE = {"480p": 0.05, "768p": 0.08}  # 1080p fal не публикует
+
+
+class MinimaxH3MaxReframe:
+    """MiniMax H3 Max Reframe — переводит видео в другое соотношение сторон:
+    исходник вписывается в новый кадр целиком, недостающее дорисовывается.
+    Таймлайн и звук сохраняются. Исходник 0.25–300 с; длинные режутся на
+    перекрывающиеся окна, и перекрытия тоже оплачиваются.
+    Цена: $0.05/с (480p), $0.08/с (768p); 1080p — апскейл из 768p, тариф
+    fal не опубликован."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "aspect_ratio": (["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21"],
+                                 {"default": "16:9"}),
+                "resolution": (["768p", "480p", "1080p"], {
+                    "default": "768p",
+                    "tooltip": "1080p — латентный апскейл из 768p"}),
+            },
+            "optional": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "что дорисовать вокруг; пусто — fal опишет "
+                               "исходник сам"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "reframe"
+    CATEGORY = "fal/MiniMax"
+
+    def reframe(self, video, aspect_ratio="16:9", resolution="768p", prompt="",
+                seed=-1, enable_safety_checker=True):
+        _require_deps()
+        endpoint = "minimax/h3-max/reframe-video"
+        url, dur, w, h, _ = _upload_video_input_ex(
+            video, label="видео для reframe", min_duration=None)
+        if dur is not None and not 0.25 <= dur <= 300.05:
+            raise RuntimeError(f"Видео {dur:.2f} с, а Reframe принимает 0.25–300 с")
+        args = {
+            "video_url": url,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        if prompt.strip():
+            args["prompt"] = prompt.strip()
+        _seed_arg(args, seed)
+
+        est = dur or 5.0
+        rate = _REFRAME_RATE.get(resolution, _REFRAME_RATE["768p"])
+        cost = (f"~${rate * est:.2f}" if resolution in _REFRAME_RATE
+                else f"от ${rate * est:.2f} (тариф 1080p fal не публикует)")
+        print(f"[fal {endpoint}] "
+              + (f"{w}x{h} -> " if w and h else "")
+              + f"{aspect_ratio} {resolution}, {est:.1f} с, ориентировочная "
+              f"стоимость {cost}"
+              + (" + перекрытия окон" if est > 15 else ""))
+        result = _run_request(endpoint, args, est_seconds=max(60, int(est * 10) + 60))
+        if (result or {}).get("placement"):
+            print(f"[fal {endpoint}] исходник в кадре: {result['placement']}")
+        return _h3max_finish(result, "minimax_h3max_reframe", endpoint)
+
+
+_RECAST_RATE = {"768P": 0.30, "1080P": 0.45}
+
+
+class MinimaxH3MaxRecast:
+    """MiniMax H3 Max Recast — заменяет людей в видео на людей с фото.
+    По умолчанию reference_1… заменяют главных людей слева направо во всех
+    планах, где они есть; иначе — укажи в prompt, кто кем становится.
+    Движение, жесты, камера, монтаж и звук сохраняются.
+    Исходник 5–30 с, ни один план не длиннее 15 с.
+    Цена: $0.30/с (768P), $0.45/с (1080P), референсы бесплатно."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "reference_1": ("IMAGE", {"tooltip": "фото первого человека "
+                                                     "(слева в кадре)"}),
+                "resolution": (["1080P", "768P"], {"default": "1080P"}),
+            },
+            "optional": {
+                "reference_2": ("IMAGE",),
+                "reference_3": ("IMAGE",),
+                "reference_4": ("IMAGE",),
+                "reference_urls": ("STRING", {"multiline": True, "default": ""}),
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "кто кем становится, что ещё оставить или "
+                               "поменять"}),
+                "enhance_realism": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "естественнее кожа и встраивание в сцену"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "recast"
+    CATEGORY = "fal/MiniMax"
+
+    def recast(self, video, reference_1, resolution="1080P", reference_2=None,
+               reference_3=None, reference_4=None, reference_urls="", prompt="",
+               enhance_realism=False, seed=-1, enable_safety_checker=True):
+        _require_deps()
+        endpoint = "minimax/h3-max/recast"
+        refs = []
+        for img in (reference_1, reference_2, reference_3, reference_4):
+            if img is not None:
+                refs += _upload_image_input(img, 4 - len(refs))
+        refs += _resolve_media_list(reference_urls, 4 - len(refs))
+
+        url, dur, w, h, _ = _upload_video_input_ex(
+            video, label="видео для recast", min_duration=None)
+        if dur is not None and not 4.95 <= dur <= 30.05:
+            raise RuntimeError(f"Видео {dur:.2f} с, а Recast принимает 5–30 с "
+                               f"(и планы не длиннее 15 с)")
+        args = {
+            "video_url": url,
+            "reference_image_urls": refs,
+            "resolution": resolution,
+            "enhance_realism": bool(enhance_realism),
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        if prompt.strip():
+            args["prompt"] = prompt.strip()
+        _seed_arg(args, seed)
+
+        est = dur or 10.0
+        print(f"[fal {endpoint}] людей на замену: {len(refs)}, {resolution}, "
+              f"{est:.1f} с, ориентировочная стоимость "
+              f"~${_RECAST_RATE[resolution] * est:.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(120, int(est * 20) + 120))
+        if (result or {}).get("seed") is not None:
+            print(f"[fal {endpoint}] seed: {result['seed']}")
+        return _h3max_finish(result, "minimax_h3max_recast", endpoint)
+
 # ---------------------------------------------------------------------------
 # Seedance 2.5 — до 30 секунд одним дублем, до 50 мультимодальных референсов
 # ---------------------------------------------------------------------------
@@ -5715,6 +6098,8 @@ NODE_CLASS_MAPPINGS = {
     "SAM2Video_fal": SAM2Video,
     "EVFSAM_fal": EVFSAM,
     "NanoBananaEdit_fal": NanoBananaEdit,
+    "Fibo2Edit_fal": Fibo2Edit,
+    "Flux3KleinEdit_fal": Flux3KleinEdit,
     "QwenImageMax_fal": QwenImageMax,
     "SeedreamV5Pro_fal": SeedreamV5Pro,
     "IdeogramImage_fal": IdeogramImage,
@@ -5733,6 +6118,8 @@ NODE_CLASS_MAPPINGS = {
     "MinimaxH3MaxVideo_fal": MinimaxH3MaxVideo,
     "MinimaxH3MaxReference_fal": MinimaxH3MaxReference,
     "MinimaxH3MaxRelight_fal": MinimaxH3MaxRelight,
+    "MinimaxH3MaxReframe_fal": MinimaxH3MaxReframe,
+    "MinimaxH3MaxRecast_fal": MinimaxH3MaxRecast,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -5763,6 +6150,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM2Video_fal": "SAM 2 Video Segment (fal)",
     "EVFSAM_fal": "EVF-SAM Text Segment (fal)",
     "NanoBananaEdit_fal": "Nano Banana 2 / 2.1 / Pro Edit (fal)",
+    "Fibo2Edit_fal": "Bria Fibo 2.0 Edit (fal)",
+    "Flux3KleinEdit_fal": "FLUX.3 Klein Edit (fal)",
     "QwenImageMax_fal": "Qwen Image Max (fal)",
     "SeedreamV5Pro_fal": "Seedream 5.0 Pro (fal)",
     "IdeogramImage_fal": "Ideogram V4 / V3 Edit (fal)",
@@ -5781,4 +6170,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MinimaxH3MaxVideo_fal": "MiniMax H3 Max Video (fal)",
     "MinimaxH3MaxReference_fal": "MiniMax H3 Max Reference-to-Video (fal)",
     "MinimaxH3MaxRelight_fal": "MiniMax H3 Max Relight (fal)",
+    "MinimaxH3MaxReframe_fal": "MiniMax H3 Max Reframe (fal)",
+    "MinimaxH3MaxRecast_fal": "MiniMax H3 Max Recast (fal)",
 }

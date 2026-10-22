@@ -56,6 +56,13 @@ function pxDims(resolution, aspect) {
   return [w, h];
 }
 
+// пиксели пресетов fal image_size
+const PRESET_PX = {
+  square_hd: 1024 * 1024, square: 512 * 512,
+  landscape_4_3: 1024 * 768, portrait_4_3: 768 * 1024,
+  landscape_16_9: 1024 * 576, portrait_16_9: 576 * 1024,
+};
+
 function fmt(x) {
   return "$" + (x < 0.1 ? x.toFixed(3) : x.toFixed(2));
 }
@@ -234,6 +241,20 @@ const CALCS = {
     v.model === "Aion" ? "$0.0017/кадр (4K $0.0057)" : "$0.001/кадр (4K $0.002)",
   FrameInterpolationFILM_fal: () => "$0.0013/с вычислений",
   TopazSDRtoHDR_fal: () => "$0.24/с (4K $0.51)",
+  Fibo2Edit_fal: () => "$0.04",
+  // плановые цены fal по мегапикселям выхода; auto — размер референса
+  Flux3KleinEdit_fal: (v) => {
+    let mp;
+    if (v.custom_width > 0 && v.custom_height > 0) mp = (v.custom_width * v.custom_height) / 1e6;
+    else if (v.image_size && v.image_size !== "auto") mp = (PRESET_PX[v.image_size] || 1048576) / 1e6;
+    else return `≈ $0.009–0.014 ×${v.num_images || 1}`;
+    const per = mp <= 0.6 ? 0.008 : mp <= 1.1 ? 0.009 : mp <= 2.4 ? 0.011 : mp <= 4.3 ? 0.014 : 0.036;
+    return `≈ ${fmt(per * (v.num_images || 1))}`;
+  },
+  // длину видео JS не знает — показываем тариф за секунду
+  MinimaxH3MaxReframe_fal: (v) =>
+    v.resolution === "1080p" ? "от $0.08/с" : `${fmt(v.resolution === "480p" ? 0.05 : 0.08)}/с`,
+  MinimaxH3MaxRecast_fal: (v) => `${fmt(v.resolution === "768P" ? 0.30 : 0.45)}/с`,
   MinimaxH3MaxRelight_fal: (v) => {
     const rate = { "480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32 }[v.resolution] ?? 0.08;
     return `${fmt(rate)}/с`;

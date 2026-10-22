@@ -57,6 +57,8 @@ FAL_KEY = ваш-ключ
 | MiniMax H3 Max Video | `minimax/h3-max[-turbo]/{text,image}-to-video` | Пост-тренированный fal вариант, быстрее реального времени |
 | MiniMax H3 Max Reference-to-Video | `minimax/h3-max/reference-to-video` | То же с мультимодальными референсами |
 | MiniMax H3 Max Relight | `minimax/h3-max/relight` | Переосвещение готового видео по картинке сферы со светом; движение, камера и звук сохраняются |
+| MiniMax H3 Max Reframe | `minimax/h3-max/reframe-video` | Смена соотношения сторон с дорисовкой краёв, звук и таймлайн сохраняются; 0.25–300 с, $0.05–0.08/с |
+| MiniMax H3 Max Recast | `minimax/h3-max/recast` | Замена людей в видео на людей с фото (до 4), движение, камера и звук сохраняются; 5–30 с, $0.30–0.45/с |
 | Kling Video | `fal-ai/kling-video/<версия>/<тир>/*-to-video` | 2.6 Pro и 2.1 master / pro / standard |
 | Wan 2.2 LoRA Video | `fal-ai/wan/v2.2-a14b/*/lora` | t2v / i2v с пользовательскими LoRA |
 
@@ -72,6 +74,8 @@ FAL_KEY = ваш-ключ
 | Seedream 5.0 Pro | `bytedance/seedream/v5/pro/{text-to-image,edit}` | Генерация и редактирование |
 | Ideogram V4 / V3 Edit | `ideogram/v4`, `fal-ai/ideogram/v3/edit` | Сильная типографика, инпейнт |
 | Nano Banana 2 / 2.1 / Pro Edit | `fal-ai/nano-banana-{2,pro}/edit`, `google/nano-banana-2.1/edit` | Правка по референсам (до 14); 2.1 считается по токенам, ~$0.04 за 1K |
+| Bria Fibo 2.0 Edit | `bria/fibo-2/edit` | Правка по инструкции, до 4 картинок `<image_1>…`, правка по маске; возвращает VGL (JSON-промпт) для доработки. $0.04 |
+| FLUX.3 Klein Edit | `blackforestlabs/flux-3/klein/edit-image` | Правка и композиция по 1–10 референсам, раскладка боксами. Плановая цена ~$0.009 за 1K |
 
 ### Апскейл и реставрация
 
