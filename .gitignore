@@ -6,3 +6,23 @@ __pycache__/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Медиа и тяжёлые файлы — в репозиторий не кладём
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+*.mxf
+*.gif
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.exr
+*.safetensors
+*.ckpt
+*.zip
