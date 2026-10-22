@@ -4412,6 +4412,343 @@ class MinimaxH3MaxRecast:
             print(f"[fal {endpoint}] seed: {result['seed']}")
         return _h3max_finish(result, "minimax_h3max_recast", endpoint)
 
+
+_EXTEND_RATE = {
+    "max": {"480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32},
+    "turbo": {"480P": 0.025, "768P": 0.04, "1080P": 0.08, "2K": 0.16},
+}
+
+
+def _h3max_audio_refs(audios, audio_refs):
+    urls = [_upload_audio_input(a) for a in audios if a is not None][:3]
+    return urls + _resolve_media_list(audio_refs, 3 - len(urls))
+
+
+class MinimaxH3MaxExtend:
+    """MiniMax H3 Max Extend — продолжает видео по промпту: 0.71–15 с нового
+    материала. Промпт описывает продолжение, а не исходник.
+    output: extended — исходник и продолжение одним роликом; continuation —
+    только новое, начиная с 1.625-с повтора конца исходника.
+    Исходник 1.625–60 с, до 50 МБ, пропорции от 0.4 до 2.5.
+    Аудио-референсы (до 3, 2–15 с, суммарно до 15 с) задают звук продолжения.
+    Цена за секунду нового материала: Max $0.05/0.08/0.16/0.32, Turbo
+    вдвое дешевле (480P/768P/1080P/2K); у Max сверх 4096 токенов
+    референсов — $0.02 за 1000."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "что происходит дальше"}),
+                "model": (_H3MAX_MODELS, {"default": _H3MAX_MODELS[0]}),
+                "duration": ("FLOAT", {"default": 5.0, "min": 0.71, "max": 15.0,
+                                       "step": 0.01,
+                                       "tooltip": "секунды нового материала"}),
+                "resolution": (["768P", "480P", "1080P", "2K"], {"default": "768P"}),
+                "aspect_ratio": (["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"], {
+                    "default": "auto",
+                    "tooltip": "auto — как у исходника; иначе видео кадрируется"}),
+                "output": (["extended", "continuation"], {
+                    "default": "extended",
+                    "tooltip": "extended — исходник + продолжение; continuation — "
+                               "только новое (с 1.625 с конца исходника)"}),
+            },
+            "optional": {
+                "audio_1": ("AUDIO",),
+                "audio_2": ("AUDIO",),
+                "audio_3": ("AUDIO",),
+                "audio_refs": ("STRING", {"multiline": True, "default": ""}),
+                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "extend"
+    CATEGORY = "fal/MiniMax"
+
+    def extend(self, video, prompt, model=_H3MAX_MODELS[0], duration=5.0,
+               resolution="768P", aspect_ratio="auto", output="extended",
+               audio_1=None, audio_2=None, audio_3=None, audio_refs="",
+               enable_prompt_expansion=True, seed=-1, enable_safety_checker=True):
+        _require_deps()
+        if not prompt.strip():
+            raise RuntimeError("Нужен prompt: что происходит дальше")
+        tier = _h3max_tier(model)
+        endpoint = ("minimax/h3-max-turbo" if tier == "turbo" else "minimax/h3-max") \
+            + "/extend-video"
+        url, dur, _, _, _ = _upload_video_input_ex(
+            video, label="видео для продолжения", min_duration=None)
+        if dur is not None and not 1.6 <= dur <= 60.05:
+            raise RuntimeError(f"Видео {dur:.2f} с, а Extend принимает 1.625–60 с")
+        args = {
+            "video_url": url,
+            "prompt": prompt,
+            "duration": round(float(duration), 3),
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "output": output,
+            "enable_prompt_expansion": bool(enable_prompt_expansion),
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        auds = _h3max_audio_refs((audio_1, audio_2, audio_3), audio_refs)
+        if auds:
+            args["reference_audio_urls"] = auds
+        _seed_arg(args, seed)
+
+        cost = _EXTEND_RATE[tier].get(resolution, 0.08) * duration
+        print(f"[fal {endpoint}] +{duration:g} с, {resolution}, {output}"
+              + (f", аудио-референсов {len(auds)}" if auds else "")
+              + f", ориентировочная стоимость ~${cost:.2f}"
+              + (" + референсы сверх 4096 токенов" if tier == "max" else ""))
+        result = _run_request(endpoint, args, est_seconds=max(30, int(duration * 4) + 30))
+        return _h3max_finish(result, "minimax_h3max_extend", endpoint)
+
+
+_INSERT_RATE = {"480p": 0.05, "768p": 0.06}
+
+
+class MinimaxH3MaxInsert:
+    """MiniMax H3 Max Insert — вставляет новую сцену в готовое видео.
+    Результат: исходник до start_time, новая сцена длиной duration, затем
+    исходник с resume_time. Сцену задают промпт и референсы (до 9 картинок,
+    до 3 видео). color_match подгоняет цвет сцены под исходник.
+    Цена за секунду новой сцены: $0.05 (480p), $0.06 (768p); сверх 4096
+    токенов референсов — $0.02 за 1000."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "prompt": ("STRING", {"multiline": True, "default": "",
+                                      "tooltip": "что происходит во вставке"}),
+                "start_time": ("FLOAT", {"default": 5.0, "min": 1.625, "max": 60.0,
+                                         "step": 0.001,
+                                         "tooltip": "секунда исходника, где "
+                                                    "начинается вставка"}),
+                "resume_time": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 60.0,
+                                          "step": 0.001,
+                                          "tooltip": "секунда исходника, с которой "
+                                                     "он продолжается после вставки"}),
+                "duration": ("FLOAT", {"default": 5.0, "min": 5.0, "max": 13.0,
+                                       "step": 0.01,
+                                       "tooltip": "длина новой сцены, с"}),
+                "resolution": (["768p", "480p"], {"default": "768p"}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "image_urls": ("STRING", {"multiline": True, "default": ""}),
+                "ref_video": ("VIDEO",),
+                "video_refs": ("STRING", {"multiline": True, "default": ""}),
+                "color_match": ("BOOLEAN", {"default": True}),
+                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "insert"
+    CATEGORY = "fal/MiniMax"
+
+    def insert(self, video, prompt, start_time, resume_time, duration=5.0,
+               resolution="768p", image_1=None, image_2=None, image_3=None,
+               image_4=None, image_urls="", ref_video=None, video_refs="",
+               color_match=True, enable_prompt_expansion=True, seed=-1):
+        _require_deps()
+        endpoint = "minimax/h3-max/insert-video"
+        if resume_time < start_time:
+            raise RuntimeError(f"resume_time {resume_time:g} с раньше start_time "
+                               f"{start_time:g} с")
+        url, dur, _, _, _ = _upload_video_input_ex(
+            video, label="видео для вставки", min_duration=None)
+        if dur is not None and resume_time > dur + 0.05:
+            raise RuntimeError(f"resume_time {resume_time:g} с дальше конца "
+                               f"исходника ({dur:.2f} с)")
+        imgs = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                imgs += _upload_image_input(img, 9 - len(imgs))
+        imgs += _resolve_media_list(image_urls, 9 - len(imgs))
+        vids = [_upload_video_input(ref_video, label="ref_video")[0]] if ref_video is not None else []
+        vids += _resolve_media_list(video_refs, 3 - len(vids))
+
+        args = {
+            "video_url": url,
+            "start_time": round(float(start_time), 3),
+            "resume_time": round(float(resume_time), 3),
+            "duration": round(float(duration), 3),
+            "resolution": resolution,
+            "color_match": bool(color_match),
+            "enable_prompt_expansion": bool(enable_prompt_expansion),
+        }
+        if prompt.strip():
+            args["prompt"] = prompt.strip()
+        if imgs:
+            args["reference_image_urls"] = imgs
+        if vids:
+            args["reference_video_urls"] = vids
+        _seed_arg(args, seed)
+        if not prompt.strip() and not imgs and not vids:
+            raise RuntimeError("Опиши вставку в prompt или подключи референсы")
+
+        cut = resume_time - start_time
+        print(f"[fal {endpoint}] вставка {duration:g} с на {start_time:g} с"
+              + (f", вырезается {cut:g} с исходника" if cut else "")
+              + f", {resolution}, референсов {len(imgs)}+{len(vids)}, "
+              f"ориентировочная стоимость ~${_INSERT_RATE[resolution] * duration:.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(60, int(duration * 10) + 60))
+        res = result or {}
+        if res.get("start_time") is not None:
+            print(f"[fal {endpoint}] вставка: {res.get('start_time')}–"
+                  f"{res.get('resume_time')} с, сгенерировано "
+                  f"{res.get('injected_duration')} с, итог {res.get('duration')} с")
+        return _h3max_finish(result, "minimax_h3max_insert", endpoint)
+
+
+_3D_RATE = {"480P": 0.05, "768P": 0.08, "1080P": 0.16}
+
+
+class MinimaxH3Max3DToVideo:
+    """MiniMax H3 Max 3D-to-Video — превращает рендер из Blender / превиз в
+    реалистичное видео: раскладка, камера и тайминг берутся из ролика,
+    внешний вид — из референсов (до 8 картинок: окружение, персонажи,
+    детали). Без референсов fal сам сгенерирует до
+    max_generated_reference_images картинок (~$0.02–0.04 каждая).
+    Исходник до 15 с и до 32 планов, длительность результата — как у него.
+    Цена: $0.05/0.08/0.16 за секунду (480P/768P/1080P), минимум 5 с, плюс
+    токены референсов."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "рендер / превиз до 15 с"}),
+                "resolution": (["768P", "480P", "1080P"], {"default": "768P"}),
+            },
+            "optional": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "что изображают прокси: «движущийся блок — "
+                               "бегущий человек». Камера и тайминг — из видео"}),
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "image_urls": ("STRING", {"multiline": True, "default": ""}),
+                "max_generated_reference_images": ("INT", {
+                    "default": 2, "min": 1, "max": 8,
+                    "tooltip": "сколько референсов сгенерировать, если своих нет"}),
+                "enable_safety_checker": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "render"
+    CATEGORY = "fal/MiniMax"
+
+    def render(self, video, resolution="768P", prompt="", image_1=None,
+               image_2=None, image_3=None, image_4=None, image_urls="",
+               max_generated_reference_images=2, enable_safety_checker=True):
+        _require_deps()
+        endpoint = "minimax/h3-max/3d-to-video"
+        url, dur, w, h, _ = _upload_video_input_ex(
+            video, label="рендер для 3D-to-Video", min_duration=None)
+        if dur is not None and dur > 15.05:
+            raise RuntimeError(f"Видео {dur:.2f} с, а 3D-to-Video принимает до 15 с")
+        imgs = []
+        for img in (image_1, image_2, image_3, image_4):
+            if img is not None:
+                imgs += _upload_image_input(img, 8 - len(imgs))
+        imgs += _resolve_media_list(image_urls, 8 - len(imgs))
+        args = {
+            "video_url": url,
+            "resolution": resolution,
+            "enable_safety_checker": bool(enable_safety_checker),
+        }
+        if prompt.strip():
+            args["prompt"] = prompt.strip()
+        if imgs:
+            args["reference_image_urls"] = imgs
+        else:
+            args["max_generated_reference_images"] = int(max_generated_reference_images)
+
+        est = max(5.0, dur or 5.0)
+        extra = "" if imgs else (f" + до {max_generated_reference_images} "
+                                 f"сгенерированных референсов (~$0.02–0.04 шт)")
+        print(f"[fal {endpoint}] {resolution}, {est:.1f} с, референсов {len(imgs)}, "
+              f"ориентировочная стоимость ~${_3D_RATE[resolution] * est:.2f}"
+              f" + токены референсов{extra}")
+        result = _run_request(endpoint, args, est_seconds=max(120, int(est * 20) + 120))
+        return _h3max_finish(result, "minimax_h3max_3d", endpoint)
+
+
+H3MAX_STYLES = ["hand-drawn", "retro-toon-70s", "low-poly", "16bit-pixel", "vhs"]
+
+
+class MinimaxH3MaxStyles:
+    """MiniMax H3 Max Styles — видео 768p со звуком в готовом стиле:
+    hand-drawn (карандашная анимация), retro-toon-70s (рисованная анимация
+    70-х), low-poly (ретро 3D), 16bit-pixel (пиксель-арт), vhs (кассета;
+    сила износа — damage_level). Стиль добавляется к промпту сам.
+    С image — генерация от первого кадра в пропорциях картинки; лучше всего
+    картинка в том же стиле. Цена $0.08/с."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "сцена, действие, камера и звук; стиль не нужен"}),
+                "style": (H3MAX_STYLES, {"default": "hand-drawn"}),
+                "duration": ("INT", {"default": 5, "min": 5, "max": 15}),
+                "aspect_ratio": (["16:9", "21:9", "4:3", "1:1", "3:4", "9:16"], {
+                    "default": "16:9",
+                    "tooltip": "игнорируется, если подключена image"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "первый кадр"}),
+                "damage_level": (["medium", "light", "heavy"], {
+                    "default": "medium", "tooltip": "только для vhs"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+            },
+        }
+
+    RETURN_TYPES = _H3MAX_RETURN_TYPES
+    RETURN_NAMES = _H3MAX_RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = "fal/MiniMax"
+
+    def generate(self, prompt, style="hand-drawn", duration=5, aspect_ratio="16:9",
+                 image=None, damage_level="medium", seed=-1):
+        _require_deps()
+        if not prompt.strip():
+            raise RuntimeError("Нужен prompt")
+        endpoint = f"minimax/h3-max/styles/{style}"
+        args = {"prompt": prompt, "duration": int(duration)}
+        if image is not None:
+            args["image_url"] = _upload_image_input(image, 1)[0]
+        else:
+            args["aspect_ratio"] = aspect_ratio
+        if style == "vhs":
+            args["damage_level"] = damage_level
+        _seed_arg(args, seed)
+        print(f"[fal {endpoint}] {duration} с, 768p, ориентировочная стоимость "
+              f"~${0.08 * duration:.2f}")
+        result = _run_request(endpoint, args, est_seconds=max(30, duration * 4 + 20))
+        return _h3max_finish(result, f"minimax_h3max_{style.replace('-', '_')}", endpoint)
+
 # ---------------------------------------------------------------------------
 # Seedance 2.5 — до 30 секунд одним дублем, до 50 мультимодальных референсов
 # ---------------------------------------------------------------------------
@@ -6120,6 +6457,10 @@ NODE_CLASS_MAPPINGS = {
     "MinimaxH3MaxRelight_fal": MinimaxH3MaxRelight,
     "MinimaxH3MaxReframe_fal": MinimaxH3MaxReframe,
     "MinimaxH3MaxRecast_fal": MinimaxH3MaxRecast,
+    "MinimaxH3MaxExtend_fal": MinimaxH3MaxExtend,
+    "MinimaxH3MaxInsert_fal": MinimaxH3MaxInsert,
+    "MinimaxH3Max3DToVideo_fal": MinimaxH3Max3DToVideo,
+    "MinimaxH3MaxStyles_fal": MinimaxH3MaxStyles,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -6172,4 +6513,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MinimaxH3MaxRelight_fal": "MiniMax H3 Max Relight (fal)",
     "MinimaxH3MaxReframe_fal": "MiniMax H3 Max Reframe (fal)",
     "MinimaxH3MaxRecast_fal": "MiniMax H3 Max Recast (fal)",
+    "MinimaxH3MaxExtend_fal": "MiniMax H3 Max Extend (fal)",
+    "MinimaxH3MaxInsert_fal": "MiniMax H3 Max Insert Scene (fal)",
+    "MinimaxH3Max3DToVideo_fal": "MiniMax H3 Max 3D-to-Video (fal)",
+    "MinimaxH3MaxStyles_fal": "MiniMax H3 Max Styles (fal)",
 }

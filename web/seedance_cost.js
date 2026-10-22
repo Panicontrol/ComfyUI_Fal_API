@@ -254,6 +254,14 @@ const CALCS = {
   // длину видео JS не знает — показываем тариф за секунду
   MinimaxH3MaxReframe_fal: (v) =>
     v.resolution === "1080p" ? "от $0.08/с" : `${fmt(v.resolution === "480p" ? 0.05 : 0.08)}/с`,
+  MinimaxH3MaxExtend_fal: (v) => {
+    const turbo = String(v.model || "").includes("Turbo");
+    const rate = ({ "480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32 }[v.resolution] ?? 0.08) / (turbo ? 2 : 1);
+    return `≈ ${fmt(rate * (v.duration || 5))}`;
+  },
+  MinimaxH3MaxInsert_fal: (v) => `≈ ${fmt((v.resolution === "480p" ? 0.05 : 0.06) * (v.duration || 5))}`,
+  MinimaxH3Max3DToVideo_fal: (v) => `${fmt({ "480P": 0.05, "768P": 0.08, "1080P": 0.16 }[v.resolution] ?? 0.08)}/с, мин 5 с`,
+  MinimaxH3MaxStyles_fal: (v) => `≈ ${fmt(0.08 * (v.duration || 5))}`,
   MinimaxH3MaxRecast_fal: (v) => `${fmt(v.resolution === "768P" ? 0.30 : 0.45)}/с`,
   MinimaxH3MaxRelight_fal: (v) => {
     const rate = { "480P": 0.05, "768P": 0.08, "1080P": 0.16, "2K": 0.32 }[v.resolution] ?? 0.08;

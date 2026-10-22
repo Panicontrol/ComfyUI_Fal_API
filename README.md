@@ -59,6 +59,10 @@ FAL_KEY = ваш-ключ
 | MiniMax H3 Max Relight | `minimax/h3-max/relight` | Переосвещение готового видео по картинке сферы со светом; движение, камера и звук сохраняются |
 | MiniMax H3 Max Reframe | `minimax/h3-max/reframe-video` | Смена соотношения сторон с дорисовкой краёв, звук и таймлайн сохраняются; 0.25–300 с, $0.05–0.08/с |
 | MiniMax H3 Max Recast | `minimax/h3-max/recast` | Замена людей в видео на людей с фото (до 4), движение, камера и звук сохраняются; 5–30 с, $0.30–0.45/с |
+| MiniMax H3 Max Extend | `minimax/h3-max{,-turbo}/extend-video` | Продолжение ролика по промпту на 0.71–15 с, с аудио-референсами; весь ролик или только новое. Max $0.05–0.32/с, Turbo вдвое дешевле |
+| MiniMax H3 Max Insert Scene | `minimax/h3-max/insert-video` | Вставка новой сцены 5–13 с между `start_time` и `resume_time` исходника, по промпту и референсам. $0.05–0.06/с |
+| MiniMax H3 Max 3D-to-Video | `minimax/h3-max/3d-to-video` | Рендер из Blender / превиз → реалистичное видео: камера и тайминг из ролика, вид из референсов. $0.05–0.16/с |
+| MiniMax H3 Max Styles | `minimax/h3-max/styles/*` | Видео в готовом стиле: hand-drawn, retro-toon-70s, low-poly, 16bit-pixel, vhs. 768p, $0.08/с |
 | Kling Video | `fal-ai/kling-video/<версия>/<тир>/*-to-video` | 2.6 Pro и 2.1 master / pro / standard |
 | Wan 2.2 LoRA Video | `fal-ai/wan/v2.2-a14b/*/lora` | t2v / i2v с пользовательскими LoRA |
 
