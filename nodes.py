@@ -5794,8 +5794,8 @@ class BytedanceVideoUpscale:
                 "target_fps": ("INT", {
                     "default": 0, "min": 0, "max": 120,
                     "tooltip": "0 — взять частоту исходника (сам fal без этого "
-                               "ставит 30 и дорисовывает кадры). Выше 30 fps "
-                               "тариф удваивается"}),
+                               "ставит 30 и дорисовывает кадры). fal принимает "
+                               "24–120 fps. Выше 30 fps тариф удваивается"}),
                 "fidelity": (["high", "medium"], {"default": "high"}),
                 "bit_depth": (_BD_BITS, {
                     "default": "8",
@@ -5825,6 +5825,10 @@ class BytedanceVideoUpscale:
             raise RuntimeError(
                 f"scale_ratio принимает значения от 1.1 до 10, а задано "
                 f"{scale_ratio}. Поставь 0, чтобы использовать target_resolution.")
+        if 0 < target_fps < 24:
+            raise RuntimeError(
+                f"target_fps принимает значения от 24 до 120, а задано "
+                f"{target_fps}. Поставь 0, чтобы взять частоту исходника.")
 
         url, dur, w, h, src_fps = _upload_video_input_ex(
             video, label="видео для апскейла", min_duration=None)
@@ -5845,6 +5849,10 @@ class BytedanceVideoUpscale:
         # 24-кадровый исходник вернётся в 30 кадрах с дорисованными кадрами.
         if target_fps and target_fps > 0:
             out_fps = float(target_fps)
+        elif src_fps and src_fps < 24:
+            out_fps = 24.0                       # ниже 24 fps fal не принимает
+            print(f"[fal] ВНИМАНИЕ: исходник {src_fps:g} fps, а fal принимает "
+                  f"от 24 — отправляю 24, недостающие кадры fal дорисует")
         elif src_fps:
             out_fps = round(src_fps, 3)          # 23.976 остаётся 23.976
             print(f"[fal] частота исходника {out_fps:g} fps — отправляю её явно, "
