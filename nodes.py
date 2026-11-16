@@ -5992,8 +5992,9 @@ class TopazFrameInterpolation:
                 "model": (_TOPAZ_INTERP_MODELS, {"default": "Apollo"}),
                 "target_fps": ("INT", {
                     "default": 0, "min": 0, "max": 120,
-                    "tooltip": "0 — удвоить частоту исходника. Кратные "
-                               "частоты (24->48) дают предсказуемые кадры"}),
+                    "tooltip": "0 — удвоить частоту исходника. fal принимает "
+                               "16–120 fps. Кратные частоты (24->48) дают "
+                               "предсказуемые кадры"}),
                 "slowdown_factor": ("INT", {
                     "default": 1, "min": 1, "max": 8,
                     "tooltip": "1 — только смена частоты; 2..8 — слоумо, "
@@ -6011,6 +6012,10 @@ class TopazFrameInterpolation:
                     slowdown_factor=1, H264_output=True):
         _require_deps()
         endpoint = "topaz/interpolate/video"
+        if 0 < target_fps < 16:
+            raise RuntimeError(
+                f"target_fps принимает значения от 16 до 120, а задано "
+                f"{target_fps}. Поставь 0, чтобы удвоить частоту исходника.")
         url, dur, w, h, src_fps = _upload_video_input_ex(
             video, label="видео для интерполяции", min_duration=None)
         if dur is not None and dur > _TOPAZ_MAX_INPUT_SEC:
@@ -6020,6 +6025,11 @@ class TopazFrameInterpolation:
 
         if target_fps and target_fps > 0:
             out_fps = int(target_fps)
+        elif src_fps and src_fps * 2 < 16:
+            k = int(-(-16 // src_fps))           # ниже 16 fps fal не принимает
+            out_fps = int(round(src_fps * k))
+            print(f"[fal] ВНИМАНИЕ: исходник {src_fps:g} fps, удвоение ниже 16, "
+                  f"а fal принимает от 16 — отправляю x{k}: {out_fps} fps")
         elif src_fps:
             out_fps = min(120, int(round(src_fps * 2)))
             print(f"[fal] target_fps = 0: исходник {src_fps:g} fps -> "
@@ -6075,10 +6085,11 @@ class FrameInterpolationFILM:
     черновиков, превью и анимации.
 
     num_frames — сколько кадров вставить между соседними: 1 удваивает
-    частоту, 3 — учетверяет. output_fps = 0 — частота считается сама
-    (исходник × (num_frames + 1)); другое число — выход в этой частоте,
-    то есть слоумо или ускорение. use_scene_detection не смешивает
-    кадры через склейки. video_quality и video_write_mode — только у FILM."""
+    частоту, 3 — учетверяет, больше 4 fal не принимает. output_fps = 0 —
+    частота считается сама (исходник × (num_frames + 1)); другое число
+    (до 60) — выход в этой частоте, то есть слоумо или ускорение.
+    use_scene_detection не смешивает кадры через склейки. video_quality
+    и video_write_mode — только у FILM."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -6087,17 +6098,19 @@ class FrameInterpolationFILM:
                 "video": ("VIDEO",),
                 "model": (["FILM", "RIFE"], {"default": "FILM"}),
                 "num_frames": ("INT", {
-                    "default": 1, "min": 1, "max": 16,
-                    "tooltip": "кадров между каждой парой исходных: 1 = x2 fps"}),
+                    "default": 1, "min": 1, "max": 4,
+                    "tooltip": "кадров между каждой парой исходных: 1 = x2 fps, "
+                               "4 = x5 (больше fal не принимает)"}),
                 "use_scene_detection": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "не интерполировать через склейки"}),
             },
             "optional": {
                 "output_fps": ("INT", {
-                    "default": 0, "min": 0, "max": 240,
+                    "default": 0, "min": 0, "max": 60,
                     "tooltip": "0 — исходник × (num_frames + 1). Своё число "
-                               "меняет скорость: 24 при x2 кадров = слоумо 2x"}),
+                               "(fal принимает 1–60) меняет скорость: 24 при "
+                               "x2 кадров = слоумо 2x"}),
                 "loop": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "дорисовать переход от последнего кадра к первому"}),
