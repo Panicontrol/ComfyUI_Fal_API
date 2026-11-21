@@ -274,16 +274,18 @@ def _probe_video_fps(path):
         return None
 
 
-def _upload_video_input(video, label="видео", min_duration=2.0):
+def _upload_video_input(video, label="видео", min_duration=2.0, check=None):
     """VIDEO-вход ComfyUI -> URL в fal storage. Возвращает (url, dur, w, h)."""
-    return _upload_video_input_ex(video, label, min_duration)[:4]
+    return _upload_video_input_ex(video, label, min_duration, check)[:4]
 
 
-def _upload_video_input_ex(video, label="видео", min_duration=2.0):
+def _upload_video_input_ex(video, label="видео", min_duration=2.0, check=None):
     """То же, что _upload_video_input, плюс частота кадров исходника.
 
     Здоровые файлы грузятся как есть; если метаданные контейнера битые
-    (Unreal/NLE) — видео перекодируется. Возвращает (url, dur, w, h, fps)."""
+    (Unreal/NLE) — видео перекодируется. Возвращает (url, dur, w, h, fps).
+    check(label, dur, w, h, fps, байты) вызывается перед самой загрузкой —
+    чтобы отказать по лимитам модели, не тратя время на аплоад."""
     if isinstance(video, str) and video.lower().startswith(("http://", "https://")):
         return video, None, None, None, None
 
@@ -328,6 +330,8 @@ def _upload_video_input_ex(video, label="видео", min_duration=2.0):
                 f"попал одиночный кадр — подключи полноценный ролик."
             )
         fps = _probe_video_fps(src)
+        if check is not None:
+            check(label, dur, w, h, fps, os.path.getsize(src))
         return fal_client.upload_file(src), dur, w, h, fps
     finally:
         for p in (tmp_src, tmp_enc):
@@ -4838,6 +4842,51 @@ _SD25_LIMITS = {"standard": (30, 10, 10, 50), "flash": (10, 5, 5, 20)}
 _SD25_CLIP_MIN, _SD25_CLIP_MAX = 1.8, 30.2   # длительность одного клипа, с
 _SD25_EXTEND_MAX = 120.0     # extension с одним видео: до 120 с на входе
 
+# лимиты fal на видео-референс: сторона кадра, отношение сторон, fps, вес файла
+_SD25_SIDE_MIN, _SD25_SIDE_MAX = 300, 6000
+_SD25_ASPECT_MIN, _SD25_ASPECT_MAX = 0.4, 2.5
+_SD25_FPS_MIN, _SD25_FPS_MAX = 24.0, 60.0
+_SD25_VIDEO_MAX_MB = 200
+
+
+def _sd25_check_video(label, dur, w, h, fps, size_bytes):
+    """Лимиты fal на видео-референс Seedance 2.5 — до загрузки файла. Что из
+    метаданных прочитать не удалось, не проверяется. Частота 23.976 проходит
+    как 24: отказываем только явно выходящим за 24–60 fps."""
+    problems = []
+    if w and h:
+        if min(w, h) < _SD25_SIDE_MIN or max(w, h) > _SD25_SIDE_MAX:
+            problems.append(f"кадр {w}x{h} — сторона должна быть от "
+                            f"{_SD25_SIDE_MIN} до {_SD25_SIDE_MAX} px")
+        ratio = w / h
+        if ratio < _SD25_ASPECT_MIN - 1e-3 or ratio > _SD25_ASPECT_MAX + 1e-3:
+            problems.append(f"отношение сторон {ratio:.2f} ({w}x{h}) — нужно от "
+                            f"{_SD25_ASPECT_MIN:g} до {_SD25_ASPECT_MAX:g}")
+    if fps and (fps < _SD25_FPS_MIN - 0.1 or fps > _SD25_FPS_MAX + 0.1):
+        problems.append(f"{fps:g} fps — нужно от {_SD25_FPS_MIN:g} до "
+                        f"{_SD25_FPS_MAX:g}")
+    if size_bytes and size_bytes > _SD25_VIDEO_MAX_MB * 1024 * 1024:
+        problems.append(f"файл {size_bytes / 1048576:.0f} МБ — нужно до "
+                        f"{_SD25_VIDEO_MAX_MB} МБ")
+    if problems:
+        raise RuntimeError(
+            f"Seedance 2.5 не примет {label}: " + "; ".join(problems) + ". "
+            "Исправь ролик до подключения: уменьши или обрежь кадр, приведи "
+            "частоту к 24–60 fps, пережми файл.")
+
+
+def _sd25_check_video_paths(video_refs):
+    """Те же лимиты для локальных файлов из поля video_refs (ссылки проверить
+    нечем — их проверит fal)."""
+    for line in _split_media_refs(video_refs):
+        if line.lower().startswith(("http://", "https://", "data:")):
+            continue
+        if os.path.isfile(line):
+            dur, w, h = _probe_video_info(line)
+            _sd25_check_video(os.path.basename(line), dur, w, h,
+                              _probe_video_fps(line), os.path.getsize(line))
+
+
 # лимиты fal на референсы — в подсказках входов (подробно в README)
 _SD25_IMG_TIP = ("до 30 картинок (flash: 10), до 30 МБ каждая; каждый кадр "
                  "батча — отдельная картинка, в промпте @Image1, @Image2 …")
@@ -4897,17 +4946,14 @@ def _sd25_collect_refs(images, videos, audios,
     wired = sum(1 for v in videos if v is not None)
     clip_max = (_SD25_EXTEND_MAX if task == "extension" and wired == 1
                 and not (video_refs or "").strip() else _SD25_CLIP_MAX)
-    img_urls = []
-    for img in images:
-        if img is not None and len(img_urls) < max_img:
-            img_urls += _upload_image_input(img, max_img - len(img_urls))
-    img_urls += _resolve_media_list(image_urls, max_img - len(img_urls))
-
+    # видео первыми: их лимиты проверяются до любой загрузки
+    _sd25_check_video_paths(video_refs)
     vid_urls, vid_total = [], 0.0
     for i, vid in enumerate(videos, 1):
         if vid is not None and len(vid_urls) < max_vid:
             url, d, _, _ = _upload_video_input(vid, label=f"video_{i}",
-                                               min_duration=None)
+                                               min_duration=None,
+                                               check=_sd25_check_video)
             if d:
                 if d < _SD25_CLIP_MIN:
                     raise RuntimeError(
@@ -4924,6 +4970,12 @@ def _sd25_collect_refs(images, videos, audios,
         print(f"[fal] суммарная длительность референс-видео {vid_total:.1f} с — "
               f"по документации пул видео рассчитан примерно на 30 с, "
               f"возможен отказ")
+
+    img_urls = []
+    for img in images:
+        if img is not None and len(img_urls) < max_img:
+            img_urls += _upload_image_input(img, max_img - len(img_urls))
+    img_urls += _resolve_media_list(image_urls, max_img - len(img_urls))
 
     aud_urls = []
     for aud in audios:
