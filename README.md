@@ -45,10 +45,11 @@ FAL_KEY = ваш-ключ
 
 | Нода | Эндпоинт fal | Что делает |
 |---|---|---|
-| Seedance 2.0 Text / Image / Reference-to-Video | `bytedance/seedance-2.0/*` (+`fast`) | До 15 с со звуком; reference принимает 9 картинок + 3 видео + 3 аудио |
-| Seedance 2.5 Video | `bytedance/seedance-2.5/{text,image}-to-video` | До 30 с одним дублем, первый и последний кадр |
-| Seedance 2.5 Reference-to-Video | `bytedance/seedance-2.5/reference-to-video` | До 30 картинок + 10 видео + 10 аудио, всего 50 файлов |
-| Seedance 1.5 Pro Text / Image-to-Video | `fal-ai/bytedance/seedance/v1.5/pro/*` | Дешевле, 4–12 с |
+| Seedance 2.0 Text / Image / Reference-to-Video | `bytedance/seedance-2.0/*` (+`fast`, +`mini`) | До 15 с со звуком, до 4K; `fast_mode` и `mini_mode` — дешёвые уровни (до 720p, mini ≈ $0.15/с); reference принимает 9 картинок + 3 видео + 3 аудио |
+| Seedance 2.5 Video | `bytedance/seedance-2.5/{text,image}-to-video` (+`flash`) | До 30 с одним дублем, до 4K, первый и последний кадр; `tier` flash — быстрый уровень до 720p; `draft` — черновик в 480p с выходом `draft_id` |
+| Seedance 2.5 Reference-to-Video | `bytedance/seedance-2.5/reference-to-video` (+`flash`) | До 30 картинок + 10 видео + 10 аудио, всего 50 файлов (flash: 10 + 5 + 5); `task`: reference, editing (правка видео), extension (продолжение, одно видео до 120 с), auto |
+| Seedance 2.5 Draft Complete | `bytedance/seedance-2.5/draft/complete` | Досчёт черновика по `draft_id` в 1080p или 4K — тот же дубль; 14 дней, оплачивается сверх черновика |
+| Seedance 1.5 Pro Text / Image-to-Video | `fal-ai/bytedance/seedance/v1.5/pro/*` | Дешевле, 4–12 с, до 1080p |
 | LTX-2.3 Video LoRA | `fal-ai/ltx-2.3-22b[/distilled]/{text,image,reference-video}-to-video[/lora]` | t2v / i2v / reference, звук, 3 слота LoRA, LoRA движения камеры |
 | LTX-2.3 Extend Video | `fal-ai/ltx-2.3-quality/extend-video[/lora]` | Продолжает ролик вперёд или назад |
 | LTX-2.3 Reframe | `fal-ai/ltx-2.3/reframe` | Меняет соотношение сторон, дорисовывая кадр |
@@ -144,7 +145,7 @@ LoRA скачивается в `models/loras`, существующий файл
 
 **Выходы.** Видео-ноды отдают `video` (нативный тип VIDEO), `video_url` и `local_path` —
 файл уже скачан в `output`. Картиночные отдают `images` и `image_urls`. У части нод есть
-дополнительные выходы: `seed` у Seedance 2.5, `expanded_prompt` у H3 Max, `caption` у
+дополнительные выходы: `seed` и `draft_id` у Seedance 2.5, `expanded_prompt` у H3 Max, `caption` у
 FLUX Vision Upscaler, `alpha` у GPT Image 2.5.
 
 **Оценка стоимости** считается до запуска по тарифам fal и выводится зелёной строкой в

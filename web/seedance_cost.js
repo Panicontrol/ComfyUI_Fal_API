@@ -3,26 +3,45 @@
 // по текущим значениям виджетов — ещё до запуска генерации.
 import { app } from "../../scripts/app.js";
 
-const RES_H = { "480p": 480, "720p": 720, "1080p": 1080 };
+const RES_H = { "480p": 480, "720p": 720, "1080p": 1080, "4k": 2160 };
 
-// Seedance: токены = w*h*24*сек/1024
-const S2_RATE = 0.014 / 1000;        // $ за токен (standard, звук бесплатно)
-const S2_FAST_RATE = 0.0112 / 1000;  // $ за токен (fast)
+// Seedance: токены = w*h*24*сек/1024. Тарифы fal на ноябрь 2026, $ за токен
+// (те же числа, что в nodes.py).
+const S2_RATE = 0.014 / 1000;        // 2.0 standard: 480p, 720p, 1080p
+const S2_4K_RATE = 0.008 / 1000;     // 2.0 standard: 4k
+const S2_FAST_RATE = 0.0112 / 1000;  // 2.0 fast
+const S2_MINI_RATE = 0.007 / 1000;   // 2.0 mini
 const S15_AUDIO_RATE = 2.4 / 1e6;    // $ за токен со звуком
 const S15_RATE = 1.2 / 1e6;          // $ за токен без звука
-const S25_RATE = 0.0214 / 1000;      // Seedance 2.5: ~$0.46/с на 720p
+const S25_RATE = { "480p": 0.0214, "720p": 0.0214, "1080p": 0.0234, "4k": 0.0094 };
+const S25_FLASH_RATE = 0.014;        // 2.5 flash: ~$0.30/с на 720p
 
-// Seedance 2.5: в токены входит и длительность входного видео, а при наличии
-// видео-референса цена умножается на 0.6. Длительность входа фронтенду
-// неизвестна, поэтому оценка считается только по выходной.
+// Seedance 2.5: в токены входит и длительность входного видео, а с
+// видео-референсом весь запрос считается по сниженному тарифу (примерно ×0.6).
+// Длительность входа фронтенду неизвестна, поэтому оценка — только по выходу.
+// Черновик всегда считается в 480p; flash умеет только 480p и 720p.
 function seedance25Cost(v, { ref = false } = {}) {
-  const [w, h] = pxDims(v.resolution, v.aspect_ratio);
-  const perSec = ((w * h * 24) / 1024) * S25_RATE;
+  const flash = v.tier === "flash";
+  const res = v.draft ? "480p" : v.resolution;
+  if (flash && (v.draft || res === "1080p" || res === "4k")) {
+    return v.draft ? "flash: без черновика" : "flash: до 720p";
+  }
+  const [w, h] = pxDims(res, v.aspect_ratio);
+  const rate = (flash ? S25_FLASH_RATE : (S25_RATE[res] ?? 0.0214)) / 1000;
+  const perSec = ((w * h * 24) / 1024) * rate;
+  const tail = (v.draft ? " черновик" : "") + (ref ? " ×0.6 c видео" : "");
   const dur = v.duration;
   if (dur === "auto" || dur === undefined || dur === null) {
-    return `≈ ${fmt(perSec * 4)}–${fmt(perSec * 30)}`;
+    return `≈ ${fmt(perSec * 4)}–${fmt(perSec * 30)}${tail}`;
   }
-  return `≈ ${fmt(perSec * parseInt(dur, 10))}${ref ? " ×0.6 c видео" : ""}`;
+  return `≈ ${fmt(perSec * parseInt(dur, 10))}${tail}`;
+}
+
+// досчёт черновика: длительность ролика фронтенду неизвестна — цена за секунду
+function seedance25CompleteCost(v) {
+  const [w, h] = pxDims(v.resolution, "16:9");
+  const perSec = ((w * h * 24) / 1024) * ((S25_RATE[v.resolution] ?? 0.0234) / 1000);
+  return `≈ ${fmt(perSec)}/с сверх черновика`;
 }
 
 // GPT Image 2: $ за изображение (пиксели -> {low, medium, high})
@@ -68,11 +87,16 @@ function fmt(x) {
 }
 
 function seedanceCost(v, { v15 = false, durMax = 15 } = {}) {
-  const [w, h] = pxDims(v.resolution, v.aspect_ratio);
+  // fast и mini у 2.0 считают максимум 720p — нода понижает разрешение сама
+  const cheap = !v15 && (v.mini_mode || v.fast_mode);
+  const res = cheap && (v.resolution === "1080p" || v.resolution === "4k") ? "720p" : v.resolution;
+  const [w, h] = pxDims(res, v.aspect_ratio);
   const tokensPerSec = (w * h * 24) / 1024;
   let rate;
   if (v15) rate = v.generate_audio ? S15_AUDIO_RATE : S15_RATE;
-  else rate = v.fast_mode ? S2_FAST_RATE : S2_RATE; // у reference fast_mode нет -> standard
+  else if (v.mini_mode) rate = S2_MINI_RATE;
+  else if (v.fast_mode) rate = S2_FAST_RATE;
+  else rate = res === "4k" ? S2_4K_RATE : S2_RATE;
   const perSec = tokensPerSec * rate;
   const dur = v.duration;
   if (dur === "auto" || dur === undefined || dur === null) {
@@ -167,6 +191,7 @@ const CALCS = {
   Seedance2ReferenceToVideo_fal: (v) => seedanceCost(v, { durMax: 15 }),
   Seedance25Video_fal: (v) => seedance25Cost(v),
   Seedance25Reference_fal: (v) => seedance25Cost(v, { ref: true }),
+  Seedance25DraftComplete_fal: (v) => seedance25CompleteCost(v),
   Seedance15ProTextToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   Seedance15ProImageToVideo_fal: (v) => seedanceCost(v, { v15: true, durMax: 12 }),
   GPTImage2TextToImage_fal: gptCost,
@@ -283,8 +308,8 @@ const DEFAULT_SIZE = {
   MinimaxH3MaxVideo_fal: [480, 620],
   MinimaxH3Video_fal: [480, 620],
   LTX23Video_fal: [480, 620],
-  Seedance2ReferenceToVideo_fal: [520, 800],
-  Seedance25Reference_fal: [520, 820],
+  Seedance2ReferenceToVideo_fal: [520, 880],
+  Seedance25Reference_fal: [520, 960],
 };
 
 app.registerExtension({
