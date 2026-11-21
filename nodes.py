@@ -4838,6 +4838,15 @@ _SD25_LIMITS = {"standard": (30, 10, 10, 50), "flash": (10, 5, 5, 20)}
 _SD25_CLIP_MIN, _SD25_CLIP_MAX = 1.8, 30.2   # длительность одного клипа, с
 _SD25_EXTEND_MAX = 120.0     # extension с одним видео: до 120 с на входе
 
+# лимиты fal на референсы — в подсказках входов (подробно в README)
+_SD25_IMG_TIP = ("до 30 картинок (flash: 10), до 30 МБ каждая; каждый кадр "
+                 "батча — отдельная картинка, в промпте @Image1, @Image2 …")
+_SD25_VID_TIP = ("до 10 видео (flash: 5): каждое 1.8–30.2 с и до 200 МБ, в сумме "
+                 "до 30.2 с, сторона 300–6000 px, отношение сторон 0.4–2.5, "
+                 "24–60 fps; в промпте @Video1 …")
+_SD25_AUD_TIP = ("до 10 аудио (flash: 5): каждое 1.8–30.2 с и до 15 МБ, в сумме "
+                 "до 30.2 с; в промпте @Audio1 …")
+
 # новые виджеты 2.5 — только в конце optional, чтобы не сдвигать сохранённые
 _SD25_TIER_INPUT = (_SD25_TIERS, {
     "default": "standard",
@@ -5088,10 +5097,12 @@ class Seedance25Reference:
                 "bitrate_mode": (_SD25_BITRATE, {"default": "standard"}),
             },
             "optional": {
-                "image_1": ("IMAGE",), "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",), "image_4": ("IMAGE",),
-                "video_1": ("VIDEO",), "video_2": ("VIDEO",), "video_3": ("VIDEO",),
-                "audio_1": ("AUDIO",), "audio_2": ("AUDIO",), "audio_3": ("AUDIO",),
+                "image_1": ("IMAGE", {"tooltip": _SD25_IMG_TIP}),
+                "image_2": ("IMAGE",), "image_3": ("IMAGE",), "image_4": ("IMAGE",),
+                "video_1": ("VIDEO", {"tooltip": _SD25_VID_TIP}),
+                "video_2": ("VIDEO",), "video_3": ("VIDEO",),
+                "audio_1": ("AUDIO", {"tooltip": _SD25_AUD_TIP}),
+                "audio_2": ("AUDIO",), "audio_3": ("AUDIO",),
                 "image_urls": ("STRING", {"default": "", "tooltip":
                                           "ссылки или пути, через запятую"}),
                 "video_refs": ("STRING", {"default": "", "tooltip":
@@ -5103,9 +5114,13 @@ class Seedance25Reference:
                 "tier": _SD25_TIER_INPUT,
                 "task": (_SD25_TASKS, {
                     "default": "reference",
-                    "tooltip": "reference — медиа как ориентир; editing — "
-                               "правка видео; extension — продолжение видео "
-                               "(одно видео до 120 с); auto — решает модель"}),
+                    "tooltip": "reference — медиа как ориентир. editing — "
+                               "правка видео: duration и aspect_ratio не "
+                               "действуют, берутся из ролика (до 30 с). "
+                               "extension — продолжение: одно видео до 120 с, "
+                               "в модель идут последние 30 с, aspect_ratio из "
+                               "ролика. auto — решает модель. Для editing и "
+                               "extension нужно видео"}),
                 "draft": _SD25_DRAFT_INPUT,
                 "codec": _SD_CODEC_INPUT,
                 "output_format": _SD25_FORMAT_INPUT,
